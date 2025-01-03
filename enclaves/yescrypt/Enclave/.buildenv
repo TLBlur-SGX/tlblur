@@ -1,0 +1,2 @@
+source /opt/intel/sgxsdk/environment
+export PATH="/home/daan/tlblur/llvm/install/bin:$PATH"

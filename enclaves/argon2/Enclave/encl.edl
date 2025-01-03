@@ -1,0 +1,9 @@
+enclave {
+	from "common.edl" import *;
+	from "sgx_pthread.edl" import *;
+
+	trusted {
+    };
+	untrusted {
+	};
+};

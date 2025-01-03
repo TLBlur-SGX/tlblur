@@ -1,0 +1,3 @@
+option('sgx_sdk', type : 'string', value : '/opt/intel/sgxsdk', description : 'Intel SGX SDK path')
+option('sgx_ssl', type : 'string', value : '/opt/intel/sgxssl/', description : 'SGX SSL path')
+option('sgx_sim', type : 'boolean', value : false, description : 'SGX simulation mode')

@@ -1,0 +1,9 @@
+[submodule "llvm/llvm-project"]
+	path = llvm/llvm-project
+	url = git@github.com:TLBlur-SGX/llvm-project.git
+[submodule "enclaves/wolfssl/Enclave/wolfssl"]
+	path = enclaves/wolfssl/Enclave/wolfssl
+	url = git@github.com:wolfSSL/wolfssl.git
+[submodule "sgx-step"]
+	path = sgx-step
+	url = git@github.com:TLBlur-SGX/sgx-step.git

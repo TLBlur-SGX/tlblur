@@ -1,0 +1,10 @@
+enclave {
+	from "common.edl" import *;	
+
+	trusted {
+        public void ecall_inc_secret(int s);
+        public void ecall_no_inc_secret(int s);
+
+        public void *ecall_get_a_adrs( void );
+    };
+};

@@ -1,0 +1,13 @@
+enclave {
+	from "common.edl" import *;	
+
+	trusted {
+		public void ecall_benchmark_setup(int id);
+    };
+    untrusted {
+        void ocall_current_time([out] double* time);
+        void ocall_low_res_time([out] int* time);
+        size_t ocall_recv(int sockfd, [out, size=len] void *buf, size_t len, int flags) propagate_errno;
+        size_t ocall_send(int sockfd, [in, size=len] const void *buf, size_t len, int flags) propagate_errno;
+    };
+};

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+mkdir -p build
+cmake -B build \
+  -DCMAKE_INSTALL_PREFIX=install \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -G Ninja \
+  -S llvm-project/llvm \
+  -DLLVM_PARALLEL_COMPILE_JOBS=24 \
+  -DLLVM_PARALLEL_LINK_JOBS=4 \
+  -DLLVM_TARGETS_TO_BUILD=Native \
+  -DLLVM_ENABLE_PROJECTS="llvm;clang;lld;bolt" \
+  -DLLVM_ENABLE_SPHINX=Off \
+  -DSPHINX_OUTPUT_HTML=false \
+  -DLLVM_ENABLE_DOXYGEN=Off \
+  -DBOLT_INCLUDE_DOCS=ON \
+  -DCLANG_INCLUDE_DOCS=ON \
+  -DLLVM_USE_LINKER= \
+  -DLLVM_ENABLE_LLD=1 \
+  -DLLVM_ENABLE_PLUGINS=ON \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=1 \
+  -DCMAKE_CXX_COMPILER="/usr/bin/clang++-15"  \
+  -DCMAKE_C_COMPILER=/usr/bin/clang-15 \
+  -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+# -DCMAKE_INSTALL_PREFIX=/opt/llvm \

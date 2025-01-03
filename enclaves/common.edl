@@ -1,0 +1,12 @@
+enclave {	
+	trusted {
+		public char *ecall_get_vtlb_addr();
+		public uint64_t *ecall_get_vtlb_counter();
+		public void *ecall_get_tlblur_code_addr();
+        public int ecall_run_benchmark(uint64_t warmup_iterations, uint64_t iterations, [user_check] uint64_t *results, [user_check] uint64_t *data_accesses, [user_check] uint64_t *code_accesses);
+    };
+	untrusted {
+        void ocall_print_string([in, string] const char *str);
+        void ocall_print_int([in, string] const char *str, uint64_t i);
+	};
+};

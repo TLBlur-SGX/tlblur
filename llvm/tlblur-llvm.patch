@@ -1,0 +1,1570 @@
+diff --git a/bolt/include/bolt/Core/MCPlusBuilder.h b/bolt/include/bolt/Core/MCPlusBuilder.h
+index 687b49a3cbda..3edb71989b84 100644
+--- a/bolt/include/bolt/Core/MCPlusBuilder.h
++++ b/bolt/include/bolt/Core/MCPlusBuilder.h
+@@ -1671,6 +1671,13 @@ public:
+     return {};
+   }
+ 
++  virtual InstructionListType
++  createTLBlurInstrumentationCall(const MCSymbol *Target, const MCSymbol *Instrumentation,
++                                  MCContext *Ctx, bool StoreEflags = false) const {
++    llvm_unreachable("not implemented");
++    return {};
++  }
++
+   /// Create a target-specific relocation out of the \p Fixup.
+   /// Note that not every fixup could be converted into a relocation.
+   virtual std::optional<Relocation>
+diff --git a/bolt/include/bolt/Passes/TLBlur.h b/bolt/include/bolt/Passes/TLBlur.h
+new file mode 100644
+index 000000000000..f24dc3de43ee
+--- /dev/null
++++ b/bolt/include/bolt/Passes/TLBlur.h
+@@ -0,0 +1,69 @@
++#ifndef BOLT_PASSES_TLBLUR_H
++#define BOLT_PASSES_TLBLUR_H
++
++#include "bolt/Core/BinaryBasicBlock.h"
++#include "bolt/Core/BinaryContext.h"
++#include "bolt/Core/BinaryFunction.h"
++#include "bolt/Core/BinarySection.h"
++#include "bolt/Core/FunctionLayout.h"
++#include "bolt/Passes/BinaryPasses.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/MC/MCSymbol.h"
++
++namespace llvm {
++namespace bolt {
++
++struct InstructionLookupResult {
++  uint64_t Addr;
++  uint64_t Size;
++  BinaryFunction::iterator BFIt;
++  BinaryBasicBlock::iterator BBIt;
++  BinaryFunction *NextFn;
++};
++
++class TLBlurPass : public BinaryFunctionPass {
++private:
++  // Size caches to speed up recomputation of memory addresses
++  DenseMap<BinaryBasicBlock *, uint64_t> BBSizeCache;
++  DenseMap<BinaryFunction *, uint64_t> BFSizeCache;
++
++  // Jumps and blocks that are already instrumented, to avoid duplication of instrumentation.
++  DenseMap<BinaryBasicBlock *, SmallPtrSet<BinaryBasicBlock *, 4>> InstrumentedJumps;
++  SmallPtrSet<BinaryBasicBlock *, 16> InstrumentedBlocks;
++
++  // Addresses of functions and blocks, used to determine if control flow crosses a page boundary.
++  DenseMap<BinaryFunction *, uint64_t> FunctionAddresses;
++  DenseMap<BinaryBasicBlock *, std::pair<uint64_t, uint64_t>> BlockAddresses;
++      
++  // Total code size
++  uint64_t Size = 0;
++
++  void updateOutputAddresses(BinaryContext &BC);
++
++  std::optional<InstructionLookupResult>
++  findInstructionAtAddress(BinaryContext &BC, uint64_t Addr);
++
++  void invalidateSizeCache(BinaryBasicBlock *BB);
++
++public:
++  explicit TLBlurPass() : BinaryFunctionPass(false) {}
++
++  const char *getName() const override { return "TLBlur"; }
++
++  bool shouldInstrument(BinaryFunction &BF);
++  bool shouldInstrument(StringRef Name, std::optional<StringRef> SectionName);
++
++  /// Pass entry point
++  void runOnFunctions(BinaryContext &BC) override;
++
++  void instrumentFallthroughs(BinaryContext &BC);
++  bool instrumentJumps(BinaryContext &BC);
++  BinaryBasicBlock::iterator insertInstrumentation(BinaryContext &BC, BinaryBasicBlock &BB,
++                             const MCSymbol *Target,
++                             BinaryBasicBlock::iterator It, bool SaveEflags);
++};
++
++} // namespace bolt
++} // namespace llvm
++
++#endif
+diff --git a/bolt/lib/Core/BinaryEmitter.cpp b/bolt/lib/Core/BinaryEmitter.cpp
+index 3bff3125a57a..7fd965cf844a 100644
+--- a/bolt/lib/Core/BinaryEmitter.cpp
++++ b/bolt/lib/Core/BinaryEmitter.cpp
+@@ -411,11 +411,18 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
+     emitLineInfoEnd(Function, EndSymbol);
+ 
+   // Exception handling info for the function.
+-  emitLSDA(Function, FF);
++  // emitLSDA(Function, FF);
+ 
+   if (FF.isMainFragment() && opts::JumpTables > JTS_NONE)
+     emitJumpTables(Function);
+ 
++
++  // // Write nops at the end of the function.
++  // if (Function.getMaxSize() != std::numeric_limits<uint64_t>::max()) {
++  //   errs() << "Emitting " << Function.getMaxSize() - FF.getImageSize() << " nops for " << Function.getDemangledName() << "\n";
++  //   Streamer.emitNops(Function.getMaxSize() - FF.getImageSize(), 10, SMLoc(), *BC.STI);
++  // }
++
+   return true;
+ }
+ 
+diff --git a/bolt/lib/Passes/CMakeLists.txt b/bolt/lib/Passes/CMakeLists.txt
+index b8bbe59a6448..38b06958090c 100644
+--- a/bolt/lib/Passes/CMakeLists.txt
++++ b/bolt/lib/Passes/CMakeLists.txt
+@@ -44,6 +44,7 @@ add_llvm_library(LLVMBOLTPasses
+   StokeInfo.cpp
+   TailDuplication.cpp
+   ThreeWayBranch.cpp
++  TLBlur.cpp
+   ValidateInternalCalls.cpp
+   ValidateMemRefs.cpp
+   VeneerElimination.cpp
+diff --git a/bolt/lib/Passes/TLBlur.cpp b/bolt/lib/Passes/TLBlur.cpp
+new file mode 100644
+index 000000000000..7eca0605fe6a
+--- /dev/null
++++ b/bolt/lib/Passes/TLBlur.cpp
+@@ -0,0 +1,399 @@
++#include "bolt/Passes/TLBlur.h"
++#include "bolt/Core/BinaryBasicBlock.h"
++#include "bolt/Core/BinaryContext.h"
++#include "bolt/Core/BinaryFunction.h"
++#include "bolt/Core/FunctionLayout.h"
++#include "bolt/Core/ParallelUtilities.h"
++#include "bolt/Utils/CommandLineOpts.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCInstPrinter.h"
++#include "llvm/MC/MCSymbol.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/Format.h"
++
++#define DEBUG_TYPE "bolt-tlblur"
++#define INSTRUMENTATION_LENGTH 19
++
++namespace opts {
++cl::opt<uint64_t> TLBlurPageMask(
++    "tlblur-page-mask",
++    cl::desc("mask to use when determining the page of an address"), cl::Hidden,
++    cl::cat(BoltCategory), cl::init(0xfff));
++
++cl::opt<bool> TLBlurInstrumentJumpTargets(
++    "tlblur-instrument-jump-targets",
++    cl::desc("instrument jump targets instead of jumps"), cl::Hidden,
++    cl::cat(BoltCategory), cl::init(false));
++
++cl::opt<bool>
++    TLBlurSaveEflags("tlblur-store-eflags",
++                     cl::desc("store eflags before calling instrumentation"),
++                     cl::Hidden, cl::cat(BoltCategory), cl::init(true));
++} // namespace opts
++
++using namespace llvm;
++
++namespace opts {} // end namespace opts
++
++namespace llvm {
++namespace bolt {
++
++/// Gets the page number of a given address.
++///
++/// An option can be set to configure the page size, which can be used
++/// to simulate larger code pages.
++static inline uint64_t pageNum(uint64_t Addr) {
++  return Addr & ~opts::TLBlurPageMask;
++}
++
++/// Finds the instruction at the given address
++std::optional<InstructionLookupResult>
++TLBlurPass::findInstructionAtAddress(BinaryContext &BC, uint64_t Addr) {
++  BinaryFunction *LastBF = nullptr;
++  auto Funcs = BC.getAllBinaryFunctions();
++  for (size_t I = 0; I < Funcs.size(); I++) {
++    auto *BF = Funcs[I];
++    if (Addr < FunctionAddresses[BF]) {
++      if (!LastBF)
++        return std::nullopt;
++
++      // Addr is inside LastBF
++      BinaryFunction::iterator BFIt = LastBF->begin();
++      auto FAddr = FunctionAddresses[LastBF];
++      while (BFIt != LastBF->end()) {
++        auto &BB = *BFIt;
++        auto Range = BlockAddresses[&BB];
++        auto Start = FAddr + Range.first;
++        auto End = FAddr + Range.second;
++        // LLVM_DEBUG(errs() << llvm::format_hex(Addr, 16) << " in [" <<
++        // llvm::format_hex(Start, 16) << " : " << llvm::format_hex(End, 16) <<
++        // "]?\n");
++        if (Start <= Addr && Addr < End) {
++          // Addr is inside BB
++          uint64_t Offset = 0;
++          BinaryBasicBlock::iterator It = BB.begin();
++          while (It != BB.end()) {
++            uint64_t Size = BC.computeInstructionSize(*It);
++            uint64_t InstAddr = Start + Offset;
++            Offset += Size;
++            if (Start + Offset > Addr) {
++              InstructionLookupResult Res;
++              Res.Addr = InstAddr;
++              Res.Size = Size;
++              Res.BFIt = BFIt;
++              Res.BBIt = It;
++              if (I + 1 < Funcs.size())
++                Res.NextFn = Funcs[I + 1];
++              return Res;
++            }
++            ++It;
++          }
++        }
++        ++BFIt;
++      }
++    }
++    LastBF = BF;
++  }
++
++  return std::nullopt;
++}
++
++void TLBlurPass::invalidateSizeCache(BinaryBasicBlock *BB) {
++  BBSizeCache[BB] = 0;
++  BFSizeCache[BB->getParent()] = 0;
++}
++
++/// Recomputes the addresses of all basic blocks
++///
++/// Uses caches for sizes of basic blocks and functions that must be explicitly
++/// invalidated using `invalidateSizeCache` before this method should be called.
++void TLBlurPass::updateOutputAddresses(BinaryContext &BC) {
++  uint64_t Offset = 0x400000; // TODO: Don't hardcode this
++  std::vector<BinaryFunction *> Functions = BC.getAllBinaryFunctions();
++
++  for (BinaryFunction *BF : Functions) {
++    uint64_t Start = Offset;
++    FunctionAddresses[BF] = Offset;
++
++    uint64_t Size = BFSizeCache.getOrInsertDefault(BF);
++    if (Size == 0) {
++      uint64_t InnerOffset = 0;
++
++      for (BinaryBasicBlock &BB : BF->blocks()) {
++        BB.setAlignment(4);
++        std::pair<uint64_t, uint64_t> Range;
++        Range.first = InnerOffset;
++        uint64_t Size = BBSizeCache.getOrInsertDefault(&BB);
++        if (Size == 0)
++          Size = BC.computeCodeSize(BB.begin(), BB.end());
++        BBSizeCache[&BB] = Size;
++        InnerOffset += Size;
++        Range.second = InnerOffset;
++        BlockAddresses[&BB] = Range;
++      }
++
++      std::pair<uint64_t, uint64_t> P = BC.calculateEmittedSize(*BF, false);
++      Size = P.first + P.second;
++    }
++    BFSizeCache[BF] = Size;
++    Offset = Start + Size;
++
++    uint64_t Alignment = BF->getAlignment();
++    uint64_t Remainder = Offset % Alignment;
++    Offset += (Remainder == 0) ? 0 : (Alignment - Remainder);
++  }
++
++  Size = Offset;
++}
++
++bool TLBlurPass::shouldInstrument(BinaryFunction &BF) {
++  return shouldInstrument(BF.getDemangledName(), BF.getOriginSectionName());
++}
++
++bool TLBlurPass::shouldInstrument(StringRef Name, std::optional<StringRef> SectionName) {
++  // HACK
++  if (Name == "sgx_spin_lock" || Name == "salsa20" || Name == "rsa_ossl_mod_exp") 
++    return false;
++      
++  return SectionName == ".tlblur.text" &&
++         Name != "tlblur_tlb_update";
++}
++
++/// Finds the first terminator of a block
++static BinaryBasicBlock::iterator getFirstTerminator(BinaryBasicBlock &BB) {
++  BinaryContext &BC = BB.getFunction()->getBinaryContext();
++  auto Itr = BB.end();
++  if (BB.empty())
++    return Itr;
++  Itr--;
++  while (Itr != BB.begin()) {
++    // BUG: Not all blocks end with a terminator, could also be CFI
++    if (!BC.MIB->isTerminator(*Itr) && !BC.MIB->isPseudo(*Itr) &&
++        !BC.MIB->isCFI(*Itr))
++      return ++Itr;
++    Itr--;
++  }
++  return Itr;
++}
++
++/// Instruments jumps that cross a page boundary. Can be called multiple times
++/// to add additional instrumentation after the binary layout has changed.
++bool TLBlurPass::instrumentJumps(BinaryContext &BC) {
++  LLVM_DEBUG(errs() << "Instrumenting jumps...\n");
++  bool Changed = false;
++  std::vector<BinaryFunction *> Functions = BC.getAllBinaryFunctions();
++
++  for (BinaryFunction *BF : Functions) {
++    if (!shouldInstrument(*BF))
++      continue;
++
++    auto FAddr = FunctionAddresses[BF];
++
++    for (BinaryBasicBlock &BB : BF->blocks()) {
++      uint64_t Page = pageNum(FAddr + BlockAddresses[&BB].second);
++      bool ChangedBlock = false;
++
++      // Direct calls
++      BinaryBasicBlock::iterator It = BB.begin();
++      while (It != BB.end()) {
++        // Only direct calls, not indirect calls
++        if (BC.MIB->isCall(*It) && !BC.MIB->isIndirectCall(*It)) {
++          const MCSymbol *Target = BC.MIB->getTargetSymbol(*It);
++          uint64_t TargetPage = pageNum(Target->getOffset());
++
++          BinaryFunction *BF = BC.getFunctionForSymbol(Target);
++
++          // Only instrument when control flow crosses a page boundary
++          if (BF && shouldInstrument(*BF) && TargetPage != Page) {
++            LLVM_DEBUG(errs() << "Instrumenting call to " << *Target << "\n");
++            // Either instrument each jump/call, or each basic block
++            if (!opts::TLBlurInstrumentJumpTargets || !BF ||
++                !BF->hasInstructions()) {
++              // Use annotations to keep track of which instructions
++              // have already been instrumented.
++              if (!BC.MIB->hasAnnotation(*It, "instrumented")) {
++                Changed = true;
++                ChangedBlock = true;
++                BC.MIB->addAnnotation(*It, "instrumented", true);
++                It = insertInstrumentation(BC, BB, Target, It,
++                                           opts::TLBlurSaveEflags);
++
++                if (!BC.MIB->isTailCall(*It)) {
++                  BC.MIB->addAnnotation(*It, "instrumented-ret", true);
++                  ++It;
++                  It = insertInstrumentation(BC, BB, BB.getLabel(), It,
++                                             opts::TLBlurSaveEflags);
++                }
++                // Invalidate the size cache of the basic block.
++                // If the size of a block changes, the entire code layout
++                // changes.
++                invalidateSizeCache(&BB);
++              }
++            } else {
++              BinaryBasicBlock &Succ = *BF->begin();
++
++              // Keep track of which blocks have already been instrumented to
++              // ensure we instrument each block only once.
++              if (!InstrumentedBlocks.contains(&Succ)) {
++                Changed = true;
++                ChangedBlock = true;
++                InstrumentedBlocks.insert(&Succ);
++                insertInstrumentation(BC, Succ, Target, Succ.begin(),
++                                      opts::TLBlurSaveEflags);
++                // Invalidate the size cache of the basic block.
++                // If the size of a block changes, the entire code layout
++                // changes.
++                invalidateSizeCache(&Succ);
++              }
++            }
++          }
++        }
++        if (It != BB.end())
++          ++It;
++      }
++
++      // Direct jumps
++      It = getFirstTerminator(BB);
++      for (BinaryBasicBlock *Succ : BB.successors()) {
++        if (!shouldInstrument(*Succ->getParent()))
++          continue;
++        auto SuccFAddr = FunctionAddresses[Succ->getParent()];
++        if (InstrumentedJumps[&BB].contains(Succ) ||
++            InstrumentedBlocks.contains(Succ))
++          continue;
++        uint64_t SuccPage = pageNum(SuccFAddr + BlockAddresses[Succ].second);
++        // Only instrument if the jump target is on a different page
++        if (SuccPage != Page) {
++          LLVM_DEBUG(errs() << "Instrumenting jump at "
++                            << llvm::format_hex(BlockAddresses[&BB].second, 16)
++                            << "\n");
++          Changed = true;
++          ChangedBlock = true;
++
++          // Either instrument at the start or at the end of each basic block
++          if (!opts::TLBlurInstrumentJumpTargets) {
++            // When instrumenting at the end, there can be instrumentation
++            // for each successor of the basic block
++            InstrumentedJumps[&BB].insert(Succ);
++            It = insertInstrumentation(BC, BB, Succ->getLabel(), It,
++                                       opts::TLBlurSaveEflags);
++            // Invalidate the size cache of the basic block.
++            // If the size of a block changes, the entire code layout changes.
++            invalidateSizeCache(&BB);
++          } else {
++            // When instrumenting at the start, we only need to instrument the
++            // target block once, regardless of the predecessor.
++            InstrumentedBlocks.insert(Succ);
++            insertInstrumentation(BC, *Succ, Succ->getLabel(), Succ->begin(),
++                                  opts::TLBlurSaveEflags);
++            // Invalidate the size cache of the basic block.
++            // If the size of a block changes, the entire code layout changes.
++            invalidateSizeCache(Succ);
++          }
++        }
++      }
++
++      // If we changed a block, immediately update the output addresses
++      if (ChangedBlock)
++        updateOutputAddresses(BC);
++    }
++  }
++
++  return Changed;
++}
++
++/// Instrument basic blocks that straddle accross two pages
++void TLBlurPass::instrumentFallthroughs(BinaryContext &BC) {
++  // For each page boundary
++  for (uint64_t Addr = 0x0; Addr < Size; Addr += (opts::TLBlurPageMask + 1)) {
++    // Find the instruction at the boundary
++    auto Res = findInstructionAtAddress(BC, Addr - INSTRUMENTATION_LENGTH);
++
++    if (Res.has_value()) {
++      auto Info = Res.value();
++      BinaryFunction::iterator BB = Info.BFIt;
++
++      if (!shouldInstrument(*BB->getParent()))
++        continue;
++
++      LLVM_DEBUG(errs() << "Instrumenting boundary at "
++                        << llvm::format_hex(Info.Addr, 16) << "\n");
++
++      // Fix: make sure we don't insert instrumentation in between terminators.
++      //
++      // Note that skipping instrumentation in this case would not be secure,
++      // since it's possible that one of the terminators is cross-page, in which
++      // case we do need to log the access to the next page, even when none of
++      // the terminators jump to that page. Hence, we insert fallthrough
++      // instrumentation anyway.
++      BinaryBasicBlock::iterator It = Info.BBIt;
++      while (It != BB->begin() && BC.MIB->isTerminator(*std::prev(It)))
++        It--;
++
++      // Create a symbol somewhere on the next page
++      MCSymbol *Target = BC.getOrCreateGlobalSymbol(Info.Addr + 100, "page");
++
++      // Insert instrumentation
++      insertInstrumentation(BC, *BB, Target, It, true);
++
++      invalidateSizeCache(&*BB);
++      updateOutputAddresses(BC);
++    } else {
++      LLVM_DEBUG(errs() << "No instruction found at boundary "
++                        << llvm::format_hex(Addr, 16) << "\n");
++    }
++  }
++}
++
++static BinaryBasicBlock::iterator
++insertInstructions(InstructionListType &Instrs, BinaryBasicBlock &BB,
++                   BinaryBasicBlock::iterator Iter) {
++  for (MCInst &NewInst : Instrs) {
++    Iter = BB.insertInstruction(Iter, NewInst);
++    ++Iter;
++  }
++  return Iter;
++}
++
++BinaryBasicBlock::iterator TLBlurPass::insertInstrumentation(
++    BinaryContext &BC, BinaryBasicBlock &BB, const MCSymbol *Target,
++    BinaryBasicBlock::iterator It, bool SaveEflags) {
++  InstructionListType Instrs = BC.MIB->createTLBlurInstrumentationCall(
++      Target, BC.Ctx->getOrCreateSymbol("tlblur_tlb_update"), BC.Ctx.get(),
++      SaveEflags);
++  return insertInstructions(Instrs, BB, It);
++}
++
++void TLBlurPass::runOnFunctions(BinaryContext &BC) {
++  BBSizeCache.clear();
++  BFSizeCache.clear();
++  InstrumentedJumps.clear();
++  InstrumentedBlocks.clear();
++  FunctionAddresses.clear();
++  BlockAddresses.clear();
++  Size = 0;
++
++  for (auto &It : BC.getBinaryFunctions()) {
++    BinaryFunction &Function = It.second;
++    if (!BC.shouldEmit(Function) || !Function.isSimple())
++      continue;
++
++    Function.fixBranches();
++  }
++  updateOutputAddresses(BC);
++
++  // While there are some cross-page jumps left uninstrumented, instrument them
++  // This converges to a fixpoint, but we may end up with redundant
++  // instrumentation
++  while (instrumentJumps(BC))
++    ;
++
++  // We have decided which jumps need to be instrumented, now insert
++  // instrumentation at page boundaries
++  instrumentFallthroughs(BC);
++}
++
++} // end namespace bolt
++} // end namespace llvm
+diff --git a/bolt/lib/Rewrite/BinaryPassManager.cpp b/bolt/lib/Rewrite/BinaryPassManager.cpp
+index 9946608c96d8..db895a5752fb 100644
+--- a/bolt/lib/Rewrite/BinaryPassManager.cpp
++++ b/bolt/lib/Rewrite/BinaryPassManager.cpp
+@@ -31,6 +31,7 @@
+ #include "bolt/Passes/RetpolineInsertion.h"
+ #include "bolt/Passes/SplitFunctions.h"
+ #include "bolt/Passes/StokeInfo.h"
++#include "bolt/Passes/TLBlur.h"
+ #include "bolt/Passes/TailDuplication.h"
+ #include "bolt/Passes/ThreeWayBranch.h"
+ #include "bolt/Passes/ValidateInternalCalls.h"
+@@ -257,6 +258,9 @@ static cl::opt<bool> CMOVConversionFlag("cmov-conversion",
+                                         cl::ReallyHidden,
+                                         cl::cat(BoltOptCategory));
+ 
++static cl::opt<bool> TLBlur("tlblur",
++                               cl::desc("enable TLBlur code page instrumentation"),
++                               cl::cat(BoltOptCategory));
+ } // namespace opts
+ 
+ namespace llvm {
+@@ -348,87 +352,87 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+   // order they're registered.
+ 
+   // Run this pass first to use stats for the original functions.
+-  Manager.registerPass(std::make_unique<PrintProgramStats>(NeverPrint));
++  // Manager.registerPass(std::make_unique<PrintProgramStats>(NeverPrint));
+ 
+   if (opts::PrintProfileStats)
+     Manager.registerPass(std::make_unique<PrintProfileStats>(NeverPrint));
+ 
+-  Manager.registerPass(std::make_unique<ValidateInternalCalls>(NeverPrint));
++  // Manager.registerPass(std::make_unique<ValidateInternalCalls>(NeverPrint));
+ 
+-  Manager.registerPass(std::make_unique<ValidateMemRefs>(NeverPrint));
++  // Manager.registerPass(std::make_unique<ValidateMemRefs>(NeverPrint));
+ 
+-  if (opts::Instrument)
+-    Manager.registerPass(std::make_unique<Instrumentation>(NeverPrint));
+-  else if (opts::Hugify)
+-    Manager.registerPass(std::make_unique<HugePage>(NeverPrint));
++  // if (opts::Instrument)
++  //   Manager.registerPass(std::make_unique<Instrumentation>(NeverPrint));
++  // else if (opts::Hugify)
++  //   Manager.registerPass(std::make_unique<HugePage>(NeverPrint));
+ 
+-  Manager.registerPass(std::make_unique<ShortenInstructions>(NeverPrint));
++  // Manager.registerPass(std::make_unique<ShortenInstructions>(NeverPrint));
+ 
+-  Manager.registerPass(std::make_unique<RemoveNops>(NeverPrint),
+-                       !opts::KeepNops);
++  // Manager.registerPass(std::make_unique<RemoveNops>(NeverPrint),
++  //                      !opts::KeepNops);
+ 
+-  Manager.registerPass(std::make_unique<NormalizeCFG>(PrintNormalized));
++  // Manager.registerPass(std::make_unique<NormalizeCFG>(PrintNormalized));
+ 
+-  Manager.registerPass(std::make_unique<StripRepRet>(NeverPrint),
+-                       opts::StripRepRet);
++  // Manager.registerPass(std::make_unique<StripRepRet>(NeverPrint),
++  //                      opts::StripRepRet);
+ 
+-  Manager.registerPass(std::make_unique<IdenticalCodeFolding>(PrintICF),
+-                       opts::ICF);
++  // Manager.registerPass(std::make_unique<IdenticalCodeFolding>(PrintICF),
++  //                      opts::ICF);
+ 
+-  Manager.registerPass(
+-      std::make_unique<SpecializeMemcpy1>(NeverPrint, opts::SpecializeMemcpy1),
+-      !opts::SpecializeMemcpy1.empty());
++  // Manager.registerPass(
++  //     std::make_unique<SpecializeMemcpy1>(NeverPrint, opts::SpecializeMemcpy1),
++  //     !opts::SpecializeMemcpy1.empty());
+ 
+-  Manager.registerPass(std::make_unique<InlineMemcpy>(NeverPrint),
+-                       opts::StringOps);
++  // Manager.registerPass(std::make_unique<InlineMemcpy>(NeverPrint),
++  //                      opts::StringOps);
+ 
+-  Manager.registerPass(std::make_unique<IndirectCallPromotion>(PrintICP));
++  // Manager.registerPass(std::make_unique<IndirectCallPromotion>(PrintICP));
+ 
+-  Manager.registerPass(
+-      std::make_unique<JTFootprintReduction>(PrintJTFootprintReduction),
+-      opts::JTFootprintReductionFlag);
++  // Manager.registerPass(
++  //     std::make_unique<JTFootprintReduction>(PrintJTFootprintReduction),
++  //     opts::JTFootprintReductionFlag);
+ 
+-  Manager.registerPass(
+-      std::make_unique<SimplifyRODataLoads>(PrintSimplifyROLoads),
+-      opts::SimplifyRODataLoads);
++  // Manager.registerPass(
++  //     std::make_unique<SimplifyRODataLoads>(PrintSimplifyROLoads),
++  //     opts::SimplifyRODataLoads);
+ 
+-  Manager.registerPass(std::make_unique<RegReAssign>(PrintRegReAssign),
+-                       opts::RegReAssign);
++  // Manager.registerPass(std::make_unique<RegReAssign>(PrintRegReAssign),
++  //                      opts::RegReAssign);
+ 
+-  Manager.registerPass(std::make_unique<Inliner>(PrintInline));
++  // Manager.registerPass(std::make_unique<Inliner>(PrintInline));
+ 
+-  Manager.registerPass(std::make_unique<IdenticalCodeFolding>(PrintICF),
+-                       opts::ICF);
++  // Manager.registerPass(std::make_unique<IdenticalCodeFolding>(PrintICF),
++  //                      opts::ICF);
+ 
+-  Manager.registerPass(std::make_unique<PLTCall>(PrintPLT));
++  // Manager.registerPass(std::make_unique<PLTCall>(PrintPLT));
+ 
+-  Manager.registerPass(std::make_unique<ThreeWayBranch>(),
+-                       opts::ThreeWayBranchFlag);
++  // Manager.registerPass(std::make_unique<ThreeWayBranch>(),
++  //                      opts::ThreeWayBranchFlag);
+ 
+   Manager.registerPass(std::make_unique<ReorderBasicBlocks>(PrintReordered));
+ 
+-  Manager.registerPass(std::make_unique<EliminateUnreachableBlocks>(PrintUCE),
+-                       opts::EliminateUnreachable);
++  // Manager.registerPass(std::make_unique<EliminateUnreachableBlocks>(PrintUCE),
++  //                      opts::EliminateUnreachable);
+ 
+-  Manager.registerPass(std::make_unique<SplitFunctions>(PrintSplit));
++  // Manager.registerPass(std::make_unique<SplitFunctions>(PrintSplit));
+ 
+-  Manager.registerPass(std::make_unique<LoopInversionPass>());
++  // Manager.registerPass(std::make_unique<LoopInversionPass>());
+ 
+-  Manager.registerPass(std::make_unique<TailDuplication>());
++  // Manager.registerPass(std::make_unique<TailDuplication>());
+ 
+-  Manager.registerPass(std::make_unique<CMOVConversion>(),
+-                       opts::CMOVConversionFlag);
++  // Manager.registerPass(std::make_unique<CMOVConversion>(),
++  //                      opts::CMOVConversionFlag);
+ 
+   // This pass syncs local branches with CFG. If any of the following
+   // passes breaks the sync - they either need to re-run the pass or
+   // fix branches consistency internally.
+-  Manager.registerPass(std::make_unique<FixupBranches>(PrintAfterBranchFixup));
++  // Manager.registerPass(std::make_unique<FixupBranches>(PrintAfterBranchFixup));
+ 
+   // This pass should come close to last since it uses the estimated hot
+   // size of a function to determine the order.  It should definitely
+   // also happen after any changes to the call graph are made, e.g. inlining.
+-  Manager.registerPass(
+-      std::make_unique<ReorderFunctions>(PrintReorderedFunctions));
++  // Manager.registerPass(
++  //     std::make_unique<ReorderFunctions>(PrintReorderedFunctions));
+ 
+   // This is the second run of the SplitFunctions pass required by certain
+   // splitting strategies (e.g. cdsplit). Running the SplitFunctions pass again
+@@ -438,14 +442,14 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+   Manager.registerPass(std::make_unique<SplitFunctions>(PrintSplit));
+ 
+   // Print final dyno stats right while CFG and instruction analysis are intact.
+-  Manager.registerPass(
+-      std::make_unique<DynoStatsPrintPass>(
+-          InitialDynoStats, "after all optimizations before SCTC and FOP"),
+-      opts::PrintDynoStats || opts::DynoStatsAll);
++  // Manager.registerPass(
++  //     std::make_unique<DynoStatsPrintPass>(
++  //         InitialDynoStats, "after all optimizations before SCTC and FOP"),
++  //     opts::PrintDynoStats || opts::DynoStatsAll);
+ 
+   // Add the StokeInfo pass, which extract functions for stoke optimization and
+   // get the liveness information for them
+-  Manager.registerPass(std::make_unique<StokeInfo>(PrintStoke), opts::Stoke);
++  // Manager.registerPass(std::make_unique<StokeInfo>(PrintStoke), opts::Stoke);
+ 
+   // This pass introduces conditional jumps into external functions.
+   // Between extending CFG to support this and isolating this pass we chose
+@@ -456,17 +460,17 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+   // modifies branches/control flow.  This pass is run after function
+   // reordering so that it can tell whether calls are forward/backward
+   // accurately.
+-  Manager.registerPass(
+-      std::make_unique<SimplifyConditionalTailCalls>(PrintSCTC),
+-      opts::SimplifyConditionalTailCalls);
++  // Manager.registerPass(
++  //     std::make_unique<SimplifyConditionalTailCalls>(PrintSCTC),
++  //     opts::SimplifyConditionalTailCalls);
+ 
+-  Manager.registerPass(std::make_unique<Peepholes>(PrintPeepholes));
++  // Manager.registerPass(std::make_unique<Peepholes>(PrintPeepholes));
+ 
+   Manager.registerPass(std::make_unique<AlignerPass>());
+ 
+   // Perform reordering on data contained in one or more sections using
+   // memory profiling data.
+-  Manager.registerPass(std::make_unique<ReorderData>());
++  // Manager.registerPass(std::make_unique<ReorderData>());
+ 
+   if (BC.isAArch64()) {
+     Manager.registerPass(std::make_unique<ADRRelaxationPass>());
+@@ -484,12 +488,12 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+   // FrameOptimizer move values around and needs to update CFIs. To do this, it
+   // must read CFI, interpret it and rewrite it, so CFIs need to be correctly
+   // placed according to the final layout.
+-  Manager.registerPass(std::make_unique<FrameOptimizerPass>(PrintFOP));
++  // Manager.registerPass(std::make_unique<FrameOptimizerPass>(PrintFOP));
+ 
+-  Manager.registerPass(std::make_unique<AllocCombinerPass>(PrintFOP));
++  // Manager.registerPass(std::make_unique<AllocCombinerPass>(PrintFOP));
+ 
+-  Manager.registerPass(
+-      std::make_unique<RetpolineInsertion>(PrintRetpolineInsertion));
++  // Manager.registerPass(
++  //     std::make_unique<RetpolineInsertion>(PrintRetpolineInsertion));
+ 
+   // Assign each function an output section.
+   Manager.registerPass(std::make_unique<AssignSections>());
+@@ -501,8 +505,8 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+   // This pass turns tail calls into jumps which makes them invisible to
+   // function reordering. It's unsafe to use any CFG or instruction analysis
+   // after this point.
+-  Manager.registerPass(
+-      std::make_unique<InstructionLowering>(PrintAfterLowering));
++  // Manager.registerPass(
++  //     std::make_unique<InstructionLowering>(PrintAfterLowering));
+ 
+   // In non-relocation mode, mark functions that do not fit into their original
+   // space as non-simple if we have to (e.g. for correct debug info update).
+@@ -510,7 +514,10 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+   if (!BC.HasRelocations)
+     Manager.registerPass(std::make_unique<CheckLargeFunctions>(NeverPrint));
+ 
+-  Manager.registerPass(std::make_unique<LowerAnnotations>(NeverPrint));
++  if (TLBlur)
++      Manager.registerPass(std::make_unique<TLBlurPass>());
++
++  // Manager.registerPass(std::make_unique<LowerAnnotations>(NeverPrint));
+ 
+   // Check for dirty state of MCSymbols caused by running calculateEmittedSize
+   // in parallel and restore them
+diff --git a/bolt/lib/Target/X86/X86MCPlusBuilder.cpp b/bolt/lib/Target/X86/X86MCPlusBuilder.cpp
+index ce8a4d691485..394e9794da3a 100644
+--- a/bolt/lib/Target/X86/X86MCPlusBuilder.cpp
++++ b/bolt/lib/Target/X86/X86MCPlusBuilder.cpp
+@@ -2434,6 +2434,56 @@ public:
+     return Code;
+   }
+ 
++  InstructionListType
++  createTLBlurInstrumentationCall(const MCSymbol *Target, const MCSymbol *Instrumentation,
++                                  MCContext *Ctx, bool StoreEflags = false) const override {
++    InstructionListType Code;
++    MCInst PushRDI;
++    createPushRegister(PushRDI, X86::RDI, 8);
++    Code.emplace_back(PushRDI);
++    MCInst PushRAX;
++    createPushRegister(PushRAX, X86::RAX, 8);
++    Code.emplace_back(PushRAX);
++    if (StoreEflags) {
++      MCInst PushFlags;
++      createPushFlags(PushFlags, 8);
++      Code.emplace_back(PushFlags);
++    } else {
++      MCInst NOP;
++      createNoop(NOP);
++      Code.emplace_back(NOP);
++    }
++
++    MCInst Load;
++    // LoadImm.setOpcode(X86::MOV64ri);
++    // LoadImm.clear();
++    // LoadImm.addOperand(MCOperand::createReg(X86::RDI));
++    // LoadImm.addOperand(MCOperand::createImm(Addr));
++    createLea(Load, Target, X86::RDI, Ctx);
++    Code.emplace_back(Load);
++
++    Code.emplace_back(MCInstBuilder(X86::CALL64pcrel32)
++                          .addExpr(MCSymbolRefExpr::create(Instrumentation, *Ctx)));
++
++    if (StoreEflags) {
++      MCInst PopFlags;
++      createPopFlags(PopFlags, 8);
++      Code.emplace_back(PopFlags);
++    } else {
++      MCInst NOP;
++      createNoop(NOP);
++      Code.emplace_back(NOP);
++    }
++    MCInst PopRAX;
++    createPopRegister(PopRAX, X86::RAX, 8);
++    Code.emplace_back(PopRAX);
++    MCInst PopRDI;
++    createPopRegister(PopRDI, X86::RDI, 8);
++    Code.emplace_back(PopRDI);
++
++    return Code;
++  }
++
+   std::optional<Relocation>
+   createRelocation(const MCFixup &Fixup,
+                    const MCAsmBackend &MAB) const override {
+diff --git a/llvm/CMakeLists.txt b/llvm/CMakeLists.txt
+index c5fa66390bba..7dad2ca86bbc 100644
+--- a/llvm/CMakeLists.txt
++++ b/llvm/CMakeLists.txt
+@@ -302,6 +302,11 @@ list(INSERT CMAKE_MODULE_PATH 0
+ # for use by clang_complete, YouCompleteMe, etc.
+ set(CMAKE_EXPORT_COMPILE_COMMANDS 1)
+ 
++if(CMAKE_EXPORT_COMPILE_COMMANDS)
++  set(CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES 
++      ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES})
++endif()
++
+ option(LLVM_INSTALL_BINUTILS_SYMLINKS
+   "Install symlinks from the binutils tool names to the corresponding LLVM tools." OFF)
+ 
+diff --git a/llvm/cmake/modules/AddLLVM.cmake b/llvm/cmake/modules/AddLLVM.cmake
+index ceec15b61114..ac29d71586d7 100644
+--- a/llvm/cmake/modules/AddLLVM.cmake
++++ b/llvm/cmake/modules/AddLLVM.cmake
+@@ -884,8 +884,8 @@ macro(add_llvm_library name)
+       get_target_export_arg(${name} LLVM export_to_llvmexports ${umbrella})
+       install(TARGETS ${name}
+               ${export_to_llvmexports}
+-              LIBRARY DESTINATION lib${LLVM_LIBDIR_SUFFIX} COMPONENT ${name}
+-              ARCHIVE DESTINATION lib${LLVM_LIBDIR_SUFFIX} COMPONENT ${name}
++              LIBRARY DESTINATION "lib${LLVM_LIBDIR_SUFFIX}" COMPONENT ${name}
++              ARCHIVE DESTINATION "lib${LLVM_LIBDIR_SUFFIX}" COMPONENT ${name}
+               RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT ${name})
+ 
+       if (NOT LLVM_ENABLE_IDE)
+diff --git a/llvm/lib/Target/X86/CMakeLists.txt b/llvm/lib/Target/X86/CMakeLists.txt
+index 610999f0cc3c..295ef34ff2c4 100644
+--- a/llvm/lib/Target/X86/CMakeLists.txt
++++ b/llvm/lib/Target/X86/CMakeLists.txt
+@@ -81,6 +81,7 @@ set(sources
+   X86TargetMachine.cpp
+   X86TargetObjectFile.cpp
+   X86TargetTransformInfo.cpp
++  X86TLBlurInstrumentHeapAccess.cpp
+   X86VZeroUpper.cpp
+   X86WinEHState.cpp
+   X86InsertWait.cpp
+diff --git a/llvm/lib/Target/X86/X86.h b/llvm/lib/Target/X86/X86.h
+index 21623a805f55..900ba96109c7 100644
+--- a/llvm/lib/Target/X86/X86.h
++++ b/llvm/lib/Target/X86/X86.h
+@@ -166,6 +166,7 @@ FunctionPass *createX86LoadValueInjectionRetHardeningPass();
+ FunctionPass *createX86SpeculativeLoadHardeningPass();
+ FunctionPass *createX86SpeculativeExecutionSideEffectSuppression();
+ FunctionPass *createX86ArgumentStackSlotPass();
++FunctionPass *createX86TLBlurInstrumentHeapPass();
+ 
+ void initializeCompressEVEXPassPass(PassRegistry &);
+ void initializeFPSPass(PassRegistry &);
+diff --git a/llvm/lib/Target/X86/X86CallingConv.td b/llvm/lib/Target/X86/X86CallingConv.td
+index 16014d6a2f60..e916ee74f3af 100644
+--- a/llvm/lib/Target/X86/X86CallingConv.td
++++ b/llvm/lib/Target/X86/X86CallingConv.td
+@@ -1220,3 +1220,7 @@ def CSR_SysV64_RegCall_NoSSE : CalleeSavedRegs<(add RBX, RBP,
+                                                (sequence "R%u", 12, 15))>;
+ def CSR_SysV64_RegCall       : CalleeSavedRegs<(add CSR_SysV64_RegCall_NoSSE,               
+                                                (sequence "XMM%u", 8, 15))>;
++
++def CSR_TLBlur_Instrument : CalleeSavedRegs<(add RBX, RCX, RDX, RSI, R8, R9, R10,
++                                           R11, R12, R13, R14, R15, RBP,
++                                           (sequence "XMM%u", 0, 15))>;
+diff --git a/llvm/lib/Target/X86/X86InstrBuilder.h b/llvm/lib/Target/X86/X86InstrBuilder.h
+index 07079ef87fd4..9ac1cb4a0ae5 100644
+--- a/llvm/lib/Target/X86/X86InstrBuilder.h
++++ b/llvm/lib/Target/X86/X86InstrBuilder.h
+@@ -23,6 +23,7 @@
+ #ifndef LLVM_LIB_TARGET_X86_X86INSTRBUILDER_H
+ #define LLVM_LIB_TARGET_X86_X86INSTRBUILDER_H
+ 
++#include "MCTargetDesc/X86BaseInfo.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/CodeGen/MachineFrameInfo.h"
+ #include "llvm/CodeGen/MachineFunction.h"
+@@ -116,6 +117,41 @@ static inline X86AddressMode getAddressFromInstr(const MachineInstr *MI,
+   return AM;
+ }
+ 
++// Like the other getAddressFromInstr, but more like TII::getAddrModeFromMemoryOp, and better than both
++static inline std::optional<X86AddressMode> getAddressFromInstr(const MachineInstr &MI) {
++  const MCInstrDesc &Desc = MI.getDesc();
++  int MemRefBegin = X86II::getMemoryOperandNo(Desc.TSFlags);
++  if (MemRefBegin < 0)
++    return std::nullopt;
++
++  MemRefBegin += X86II::getOperandBias(Desc);
++
++  X86AddressMode AM;
++  auto &BaseOp = MI.getOperand(MemRefBegin + X86::AddrBaseReg);
++  if (BaseOp.isReg()) {
++    AM.BaseType = X86AddressMode::RegBase;
++    AM.Base.Reg = BaseOp.getReg();
++  } else if (BaseOp.isFI()) {
++    AM.BaseType = X86AddressMode::FrameIndexBase;
++    AM.Base.FrameIndex = BaseOp.getIndex();
++  } else {
++    return std::nullopt;    
++  }
++
++  AM.IndexReg = MI.getOperand(MemRefBegin + X86::AddrIndexReg).getReg();
++  AM.Scale = MI.getOperand(MemRefBegin + X86::AddrScaleAmt).getImm();
++
++  const MachineOperand &DispMO = MI.getOperand(MemRefBegin + X86::AddrDisp);
++  if (DispMO.isGlobal())
++    AM.GV = DispMO.getGlobal();
++  else if (DispMO.isImm())
++    AM.Disp = DispMO.getImm();
++  else
++    return std::nullopt;
++
++  return AM;
++}
++
+ /// addDirectMem - This function is used to add a direct memory reference to the
+ /// current instruction -- that is, a dereference of an address in a register,
+ /// with no scale, index or displacement. An example is: DWORD PTR [EAX].
+diff --git a/llvm/lib/Target/X86/X86RegisterInfo.cpp b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+index e76d0d7bf50e..e07167efba07 100644
+--- a/llvm/lib/Target/X86/X86RegisterInfo.cpp
++++ b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+@@ -45,6 +45,8 @@ static cl::opt<bool>
+ EnableBasePointer("x86-use-base-pointer", cl::Hidden, cl::init(true),
+           cl::desc("Enable use of a base pointer for complex stack frames"));
+ 
++extern cl::opt<bool> TLBlurCounterRegister;
++
+ X86RegisterInfo::X86RegisterInfo(const Triple &TT)
+     : X86GenRegisterInfo((TT.isArch64Bit() ? X86::RIP : X86::EIP),
+                          X86_MC::getDwarfRegFlavour(TT, false),
+@@ -406,6 +408,10 @@ X86RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
+   return CallsEHReturn ? CSR_32EHRet_SaveList : CSR_32_SaveList;
+ }
+ 
++const uint32_t *X86RegisterInfo::getCalleeSavedRegsTLBlurMask() const {
++  return CSR_TLBlur_Instrument_RegMask;
++}
++
+ const MCPhysReg *X86RegisterInfo::getCalleeSavedRegsViaCopy(
+     const MachineFunction *MF) const {
+   assert(MF && "Invalid MachineFunction pointer.");
+@@ -627,6 +633,16 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+       Reserved.set(*AI);
+   }
+ 
++  // TLBlur: reserve register for global counter optimization
++  if (TLBlurCounterRegister) {
++    Reserved.set(X86::R15);
++    Reserved.set(X86::R15D);
++    Reserved.set(X86::R15B);
++    Reserved.set(X86::R15BH);
++    Reserved.set(X86::R15W);
++    Reserved.set(X86::R15WH);
++  }
++
+   assert(checkAllSuperRegsMarked(Reserved,
+                                  {X86::SIL, X86::DIL, X86::BPL, X86::SPL,
+                                   X86::SIH, X86::DIH, X86::BPH, X86::SPH}));
+diff --git a/llvm/lib/Target/X86/X86RegisterInfo.h b/llvm/lib/Target/X86/X86RegisterInfo.h
+index 7296a5f021e4..0bb143190fce 100644
+--- a/llvm/lib/Target/X86/X86RegisterInfo.h
++++ b/llvm/lib/Target/X86/X86RegisterInfo.h
+@@ -104,6 +104,7 @@ public:
+   getCalleeSavedRegs(const MachineFunction* MF) const override;
+   const MCPhysReg *
+   getCalleeSavedRegsViaCopy(const MachineFunction *MF) const;
++  const uint32_t *getCalleeSavedRegsTLBlurMask() const;
+   const uint32_t *getCallPreservedMask(const MachineFunction &MF,
+                                        CallingConv::ID) const override;
+   const uint32_t *getNoPreservedMask() const override;
+diff --git a/llvm/lib/Target/X86/X86TLBlurInstrumentHeapAccess.cpp b/llvm/lib/Target/X86/X86TLBlurInstrumentHeapAccess.cpp
+new file mode 100644
+index 000000000000..2085b47e1745
+--- /dev/null
++++ b/llvm/lib/Target/X86/X86TLBlurInstrumentHeapAccess.cpp
+@@ -0,0 +1,532 @@
++#include "MCTargetDesc/X86MCTargetDesc.h"
++#include "X86.h"
++#include "X86CallingConv.h"
++#include "X86FrameLowering.h"
++#include "X86InstrBuilder.h"
++#include "X86InstrInfo.h"
++#include "X86MachineFunctionInfo.h"
++#include "X86RegisterInfo.h"
++#include "X86Subtarget.h"
++#include "X86TargetMachine.h"
++#include "llvm/CodeGen/LivePhysRegs.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineInstr.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/TargetInstrInfo.h"
++#include "llvm/CodeGen/TargetOpcodes.h"
++#include "llvm/CodeGen/TargetRegisterInfo.h"
++#include "llvm/IR/DebugLoc.h"
++#include "llvm/IR/Type.h"
++#include "llvm/MC/MCRegister.h"
++#include "llvm/Support/Debug.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "x86-tlblur"
++
++#define DEBUG_FILTER "read_markers"
++
++#define COUNTER_REG X86::R15
++
++// Number of array entries of size 8
++#define TLBLUR_VTLB_SIZE 0x10000
++
++static cl::opt<bool>
++    TLBlurInline("x86-tlblur-inline",
++                 cl::desc("Use inlined TLBlur instrumentation"),
++                 cl::init(false), cl::Hidden);
++
++cl::opt<bool>
++    TLBlurCounterRegister("x86-tlblur-counter-register",
++                          cl::desc("Use dedicated register for global counter"),
++                          cl::init(false), cl::Hidden);
++
++namespace {
++
++/// Data access and indirect call instrumentation for TLBlur
++class TLBlurInstrumentHeap : public MachineFunctionPass {
++  MachineRegisterInfo *MRI = nullptr;
++  const X86InstrInfo *TII;
++  const X86RegisterInfo *TRI;
++  uint64_t Counter = 0;
++  bool Debug = false;
++  SmallPtrSet<MachineInstr *, 8> RDICopies;
++  DenseMap<MachineBasicBlock *, Register> CounterRegs;
++
++  std::optional<X86AddressMode> getAddressMode(MachineInstr &MI);
++  Register writeAddrModeToReg(X86AddressMode AM,
++                              MachineBasicBlock::iterator &InsertPoint,
++                              unsigned int OpCode = X86::LEA64r);
++  Register writeRIPToReg(MachineBasicBlock::iterator InsertPoint,
++                         MachineBasicBlock &MBB);
++  std::optional<Register> writeIndirectCallAddrToReg(MachineInstr &MI);
++
++  MachineBasicBlock::iterator
++  insertTLBUpdate(Register AddrReg, MachineBasicBlock::iterator InsertPoint,
++                  MachineBasicBlock &MBB, LivePhysRegs &LiveIns);
++
++  unsigned saveEFLAGS(MachineBasicBlock &MBB,
++                      MachineBasicBlock::iterator InsertPt,
++                      const DebugLoc &Loc);
++  void restoreEFLAGS(MachineBasicBlock &MBB,
++                     MachineBasicBlock::iterator InsertPt, const DebugLoc &Loc,
++                     Register Reg);
++
++  unsigned saveReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
++                   const DebugLoc &Loc, const TargetRegisterClass *RegClass,
++                   Register SourceReg);
++  void restoreReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
++                  const DebugLoc &Loc, Register SavedReg, Register TargetReg);
++
++  Register loadGlobalCounter(MachineBasicBlock &MBB,
++                             MachineBasicBlock::iterator InsertPt,
++                             const DebugLoc &Loc);
++  void storeGlobalCounter(MachineBasicBlock &MBB,
++                          MachineBasicBlock::iterator InsertPt,
++                          const DebugLoc &Loc, Register Reg);
++
++public:
++  static char ID;
++
++  TLBlurInstrumentHeap() : MachineFunctionPass(ID) {}
++
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
++  StringRef getPassName() const override {
++    return "X86 TLBlur instrument heap accesses";
++  }
++};
++
++} // namespace
++
++unsigned TLBlurInstrumentHeap::saveEFLAGS(MachineBasicBlock &MBB,
++                                          MachineBasicBlock::iterator InsertPt,
++                                          const DebugLoc &Loc) {
++  return saveReg(MBB, InsertPt, Loc, &X86::GR32RegClass, X86::EFLAGS);
++}
++
++void TLBlurInstrumentHeap::restoreEFLAGS(MachineBasicBlock &MBB,
++                                         MachineBasicBlock::iterator InsertPt,
++                                         const DebugLoc &Loc, Register Reg) {
++  restoreReg(MBB, InsertPt, Loc, Reg, X86::EFLAGS);
++}
++
++unsigned TLBlurInstrumentHeap::saveReg(MachineBasicBlock &MBB,
++                                       MachineBasicBlock::iterator InsertPt,
++                                       const DebugLoc &Loc,
++                                       const TargetRegisterClass *RegClass,
++                                       Register SourceReg) {
++  Register Reg = MRI->createVirtualRegister(RegClass);
++  BuildMI(MBB, InsertPt, Loc, TII->get(X86::COPY), Reg).addReg(SourceReg);
++  return Reg;
++}
++
++void TLBlurInstrumentHeap::restoreReg(MachineBasicBlock &MBB,
++                                      MachineBasicBlock::iterator InsertPt,
++                                      const DebugLoc &Loc, Register SavedVReg,
++                                      Register TargetReg) {
++  BuildMI(MBB, InsertPt, Loc, TII->get(X86::COPY), TargetReg).addReg(SavedVReg);
++}
++
++std::optional<X86AddressMode>
++TLBlurInstrumentHeap::getAddressMode(MachineInstr &MI) {
++  if (!MI.mayLoadOrStore() && !MI.isCall()) {
++    // If you can't load or store, you can't access the heap
++    return std::nullopt;
++  }
++
++  if (MI.getNumOperands() > 0) {
++    auto &Last = MI.getOperand(MI.getNumOperands() - 1);
++    if (Last.isReg() && Last.getReg().isPhysical() &&
++        Last.getReg().asMCReg() == X86::FS) {
++      LLVM_DEBUG(
++          errs() << "HACK: Skipping Thread Local Storage instrumentation!\n");
++      return std::nullopt;
++    }
++
++    for (auto Op : MI.explicit_operands()) {
++      if (Op.isReg() && Op.getReg().isVirtual()) {
++        const auto *RegClass = MRI->getRegClass(Op.getReg());
++        if (!RegClass)
++          continue;
++        auto ID = RegClass->getID();
++        if (ID == X86::VR256RegClassID || ID == X86::VR256XRegClassID ||
++            ID == X86::VR512RegClassID || ID == X86::VR512_0_15RegClassID) {
++          LLVM_DEBUG(errs() << "HACK: Skipping VR register instrumentation!\n");
++          return std::nullopt;
++        }
++      }
++    }
++  }
++
++  std::optional<X86AddressMode> AM = getAddressFromInstr(MI);
++
++  if (!AM.has_value())
++    return std::nullopt;
++
++  if (AM.value().BaseType == X86AddressMode::FrameIndexBase) {
++    // Is definitely a stack access
++    return std::nullopt;
++  }
++
++  auto &MRI = MI.getParent()->getParent()->getRegInfo();
++  if (Register::isVirtualRegister(AM.value().Base.Reg)) {
++    MachineInstr *Def = MRI.getVRegDef(AM.value().Base.Reg);
++    if (Def->getOpcode() == X86::LEA64r) {
++      // The base register is an address loaded from an address mode with LEA
++      std::optional<X86AddressMode> AM = getAddressFromInstr(*Def);
++      if (!AM.has_value() ||
++          AM.value().BaseType == X86AddressMode::FrameIndexBase) {
++        // We load the effective address from a frame index, so it's a store to
++        // the stack
++        return std::nullopt;
++      }
++    }
++  }
++
++  // Assume it might be a heap access in all other cases
++  return AM;
++}
++
++Register TLBlurInstrumentHeap::writeAddrModeToReg(
++    X86AddressMode AM, MachineBasicBlock::iterator &InsertPoint,
++    unsigned int OpCode) {
++  auto Result =
++      MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
++  auto &MBB = *InsertPoint->getParent();
++  auto &MF = *MBB.getParent();
++
++  MachineInstr *NewMI = nullptr;
++  // Make sure we insert instrumentation before the call sequence start!
++  for (MachineInstr &PrevMI :
++       llvm::reverse(llvm::make_range(MBB.begin(), InsertPoint))) {
++
++    // If we encounter a call frame destroy, we are not inside a call sequence
++    if (PrevMI.getOpcode() == TII->getCallFrameDestroyOpcode())
++      break;
++
++    // If we find a call frame setup, insert instrumentation before this
++    // instruction
++    if (PrevMI.getOpcode() == TII->getCallFrameSetupOpcode()) {
++      NewMI = &PrevMI;
++      break;
++    }
++  }
++
++  if (NewMI) {
++    LLVM_DEBUG(
++        errs() << "Inside call sequence, trying to fix the address mode\n");
++    for (MachineInstr &MI : llvm::make_range(
++             MachineBasicBlock::iterator(NewMI->getIterator()), InsertPoint)) {
++      if (MI.definesRegister(AM.IndexReg)) {
++        if (MI.isCopyLike()) {
++          AM.IndexReg = MI.getOperand(1).getReg();
++        } else {
++          LLVM_DEBUG(errs() << "Skipping instrumentation in call sequence!\n");
++          return MCRegister::NoRegister;
++        }
++      }
++
++      if (AM.BaseType == X86AddressMode::RegBase &&
++          MI.definesRegister(AM.Base.Reg)) {
++        if (MI.isCopyLike()) {
++          AM.Base.Reg = MI.getOperand(1).getReg();
++        } else {
++          LLVM_DEBUG(errs() << "Skipping instrumentation in call sequence!\n");
++          return MCRegister::NoRegister;
++        }
++      }
++    }
++
++    InsertPoint = NewMI->getIterator();
++  }
++
++  auto &LEA =
++      addFullAddress(BuildMI(MF, DebugLoc(), TII->get(OpCode), Result), AM);
++  MBB.insert(InsertPoint, LEA);
++  return Result;
++}
++
++Register
++TLBlurInstrumentHeap::writeRIPToReg(MachineBasicBlock::iterator InsertPoint,
++                                    MachineBasicBlock &MBB) {
++  auto Result =
++      MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
++  auto &MF = *MBB.getParent();
++  auto &Copy = BuildMI(MF, DebugLoc(), TII->get(TargetOpcode::COPY), Result)
++                   .addReg(X86::RIP);
++  MBB.insert(InsertPoint, Copy);
++  return Result;
++}
++
++static X86AddressMode getGlobalCounterAM(Module *M) {
++  X86AddressMode CounterAM;
++  CounterAM.GV = M->getGlobalVariable("__tlblur_global_counter");
++  CounterAM.Base.Reg = X86::RIP;
++  return CounterAM;
++}
++
++Register
++TLBlurInstrumentHeap::loadGlobalCounter(MachineBasicBlock &MBB,
++                                        MachineBasicBlock::iterator InsertPoint,
++                                        const DebugLoc &Loc) {
++  auto &MF = *MBB.getParent();
++  Module *M = MF.getFunction().getParent();
++  auto CounterAM = getGlobalCounterAM(M);
++  auto CounterReg =
++      MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
++  addFullAddress(
++      BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::MOV64rm), CounterReg),
++      CounterAM);
++  return CounterReg;
++}
++
++void TLBlurInstrumentHeap::storeGlobalCounter(
++    MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPoint,
++    const DebugLoc &Loc, Register Reg) {
++  auto &MF = *MBB.getParent();
++  Module *M = MF.getFunction().getParent();
++  auto CounterAM = getGlobalCounterAM(M);
++  addFullAddress(BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::MOV64mr)),
++                 CounterAM)
++      .addReg(Reg);
++}
++
++MachineBasicBlock::iterator TLBlurInstrumentHeap::insertTLBUpdate(
++    Register AddrReg, MachineBasicBlock::iterator InsertPoint,
++    MachineBasicBlock &MBB, LivePhysRegs &LiveIns) {
++  auto &MF = *MBB.getParent();
++  Module *M = MF.getFunction().getParent();
++
++  if (TLBlurInline) {
++    // Insert code inline
++
++    // Save eflags if it is live
++    recomputeLiveIns(MBB);
++    bool IsEFLAGSLive = LiveIns.contains(X86::EFLAGS);
++    Register FlagsReg = 0;
++    if (IsEFLAGSLive)
++      FlagsReg = saveEFLAGS(MBB, InsertPoint, DebugLoc());
++
++    auto ImageBaseReg =
++        MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
++    auto LEA = BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::LEA64r),
++                       ImageBaseReg);
++    X86AddressMode ImageBaseAM;
++    ImageBaseAM.GV = M->getGlobalVariable("__ImageBase");
++    ImageBaseAM.Base.Reg = X86::RIP;
++    addFullAddress(LEA, ImageBaseAM);
++
++    auto PageRegTemp =
++        MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
++    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::SUB64rr), PageRegTemp)
++        .addReg(AddrReg)
++        .addReg(ImageBaseReg);
++    auto PageRegTemp2 =
++        MRI->createVirtualRegister(TRI->getRegClass(X86::GR64_NOSPRegClassID));
++    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::SAR64ri), PageRegTemp2)
++        .addReg(PageRegTemp)
++        .addImm(12);
++    auto PageRegTemp3 =
++        MRI->createVirtualRegister(TRI->getRegClass(X86::GR64_NOSPRegClassID));
++    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::AND64ri32),
++            PageRegTemp3)
++        .addReg(PageRegTemp2)
++        .addImm(TLBLUR_VTLB_SIZE - 1);
++    auto PageReg =
++        MRI->createVirtualRegister(TRI->getRegClass(X86::GR64_NOSPRegClassID));
++    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::SHL64ri), PageReg)
++        .addReg(PageRegTemp3)
++        .addImm(3);
++
++    Register Counter = 0;
++    if (!TLBlurCounterRegister) {
++      auto CounterReg = loadGlobalCounter(MBB, InsertPoint, DebugLoc());
++      auto CounterIncReg =
++          MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
++      BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::INC64r),
++              CounterIncReg)
++          .addReg(CounterReg);
++      Counter = CounterIncReg;
++    } else {
++      BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::INC64r), COUNTER_REG)
++          .addReg(COUNTER_REG);
++      Counter = COUNTER_REG;
++    }
++
++    X86AddressMode VTLBAM;
++    VTLBAM.GV = M->getGlobalVariable("__tlblur_shadow_pt");
++    VTLBAM.Base.Reg = X86::RIP;
++    auto VTLBReg =
++        MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
++    addFullAddress(
++        BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::LEA64r), VTLBReg),
++        VTLBAM);
++
++    auto TargetAddrReg =
++        MRI->createVirtualRegister(TRI->getRegClass(X86::GR64RegClassID));
++    BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::ADD64rr), TargetAddrReg)
++        .addReg(VTLBReg)
++        .addReg(PageReg);
++
++    X86AddressMode TargetAM;
++    TargetAM.Base.Reg = TargetAddrReg;
++    auto Store = BuildMI(MBB, InsertPoint, DebugLoc(), TII->get(X86::MOV64mr));
++    addFullAddress(Store, TargetAM).addReg(Counter);
++
++    if (!TLBlurCounterRegister)
++      storeGlobalCounter(MBB, InsertPoint, DebugLoc(), Counter);
++
++    // Restore eflags if necessary
++    if (FlagsReg)
++      restoreEFLAGS(MBB, InsertPoint, DebugLoc(), FlagsReg);
++  } else {
++    // Insert a function call to update the software TLB
++
++    recomputeLiveIns(MBB);
++    bool IsRDILive = LiveIns.contains(X86::RDI);
++    bool IsEDILive = LiveIns.contains(X86::EDI);
++    bool IsRAXLive = LiveIns.contains(X86::RAX);
++    bool IsEAXLive = LiveIns.contains(X86::EAX);
++    bool IsEFLAGSLive = LiveIns.contains(X86::EFLAGS);
++
++    Register FlagsReg = 0;
++    if (IsEFLAGSLive)
++      FlagsReg = saveEFLAGS(MBB, InsertPoint, DebugLoc());
++    Register RDI = 0;
++    if (IsRDILive || IsEDILive)
++      RDI = saveReg(MBB, InsertPoint, DebugLoc(), &X86::GR64RegClass, X86::RDI);
++    Register RAX = 0;
++    if (IsRAXLive || IsEAXLive)
++      RAX = saveReg(MBB, InsertPoint, DebugLoc(), &X86::GR64RegClass, X86::RAX);
++
++    MBB.insert(InsertPoint,
++               BuildMI(MF, DebugLoc(), TII->get(TII->getCallFrameSetupOpcode()))
++                   .addImm(0)
++                   .addImm(0)
++                   .addImm(0));
++
++    // Copy address to %rdi
++    MachineInstr *RDICopy =
++        BuildMI(MF, DebugLoc(), TII->get(TargetOpcode::COPY), X86::RDI)
++            .addReg(AddrReg);
++    MBB.insert(InsertPoint, RDICopy);
++
++    // Call instrumentation
++    MBB.insert(InsertPoint,
++               BuildMI(MF, DebugLoc(), TII->get(X86::CALL64pcrel32))
++                   .addGlobalAddress(M->getNamedValue("tlblur_tlb_update"))
++                   .addRegMask(TRI->getCalleeSavedRegsTLBlurMask())
++                   .addUse(X86::RDI, IsRDILive ? RegState::Implicit
++                                               : RegState::ImplicitKill));
++    MBB.insert(InsertPoint, BuildMI(MF, DebugLoc(),
++                                    TII->get(TII->getCallFrameDestroyOpcode()))
++                                .addImm(0)
++                                .addImm(0));
++
++    if (RAX)
++      restoreReg(MBB, InsertPoint, DebugLoc(), RAX, X86::RAX);
++    if (RDI)
++      restoreReg(MBB, InsertPoint, DebugLoc(), RDI, X86::RDI);
++    if (FlagsReg)
++      restoreEFLAGS(MBB, InsertPoint, DebugLoc(), FlagsReg);
++  }
++
++  return InsertPoint;
++}
++
++char TLBlurInstrumentHeap::ID = 0;
++
++FunctionPass *llvm::createX86TLBlurInstrumentHeapPass() {
++  return new TLBlurInstrumentHeap();
++}
++
++bool TLBlurInstrumentHeap::runOnMachineFunction(MachineFunction &MF) {
++  Counter = 0;
++  RDICopies.clear();
++  CounterRegs.clear();
++  const X86Subtarget &ST = MF.getSubtarget<X86Subtarget>();
++  TII = ST.getInstrInfo();
++  TRI = ST.getRegisterInfo();
++  MRI = &MF.getRegInfo();
++  Debug = false;
++
++#ifdef DEBUG_FILTER
++  if (MF.getFunction().getName() == DEBUG_FILTER) {
++    Debug = true;
++    LLVM_DEBUG(errs() << "--------------------------------\n");
++
++    LLVM_DEBUG(MF.dump());
++
++    LLVM_DEBUG(errs() << "--------------------------------\n");
++  }
++#endif
++
++  // Declare externally defined globals
++  Module *M = MF.getFunction().getParent();
++  M->getOrInsertFunction("tlblur_tlb_update", Type::getVoidTy(M->getContext()),
++                         PointerType::getUnqual(M->getContext()));
++  M->getOrInsertGlobal("__ImageBase", PointerType::getUnqual(M->getContext()));
++  M->getOrInsertGlobal("__tlblur_global_counter",
++                       PointerType::getUnqual(M->getContext()));
++  M->getOrInsertGlobal("__tlblur_shadow_pt",
++                       PointerType::getUnqual(M->getContext()));
++
++  SmallVector<std::tuple<MachineInstr *, X86AddressMode>> ToInstrument;
++
++  for (MachineBasicBlock &MBB : MF) {
++    for (MachineInstr &MI : MBB) {
++      // Get the address mode of the instruction
++      std::optional<X86AddressMode> AM = getAddressMode(MI);
++
++      // If the instruction has an address mode, insert instrumentation
++      if (AM.has_value()) {
++        MachineBasicBlock::iterator InsertPoint = MI.getIterator();
++
++        // Try to insert code that writes the address mode to a register
++        //
++        // Note: indirect calls load from the address to get the function address
++        Register AddrReg = writeAddrModeToReg(
++            *AM, InsertPoint, MI.isCall() ? X86::MOV64rm : X86::LEA64r);
++
++        if (AddrReg.isValid()) {
++          // Figure out which physical registers are currently live
++          LivePhysRegs LiveIns(*TRI);
++          LiveIns.addLiveOuts(MBB);
++          for (MachineInstr &MI :
++               llvm::reverse(llvm::make_range(InsertPoint, MBB.end()))) {
++            LiveIns.stepBackward(MI);
++          }
++
++          // Insert code to update the software TLB
++          insertTLBUpdate(AddrReg, InsertPoint, MBB, LiveIns);
++          Counter++;
++        }
++      }
++    }
++  }
++
++#ifdef DEBUG_FILTER
++  if (MF.getFunction().getName() == DEBUG_FILTER) {
++    LLVM_DEBUG(errs() << "--------------------------------\n");
++
++    LLVM_DEBUG(errs() << "Result:\n");
++
++    LLVM_DEBUG(errs() << "--------------------------------\n");
++
++    LLVM_DEBUG(MF.dump());
++
++    LLVM_DEBUG(errs() << "--------------------------------\n");
++  }
++#endif
++
++  // LLVM_DEBUG(errs() << "TLBlur: " << MF.getFunction().getName() << " ("
++  //                   << Counter << " instrumentation calls)"
++  //                   << "\n");
++  errs() << "TLBlur: " << MF.getFunction().getName() << " ("
++                    << Counter << " instrumentation calls)"
++                    << "\n";
++
++  return true;
++}
+diff --git a/llvm/lib/Target/X86/X86TargetMachine.cpp b/llvm/lib/Target/X86/X86TargetMachine.cpp
+index 9e4cf1ea9968..2fbd30984afc 100644
+--- a/llvm/lib/Target/X86/X86TargetMachine.cpp
++++ b/llvm/lib/Target/X86/X86TargetMachine.cpp
+@@ -63,6 +63,11 @@ static cl::opt<bool>
+                      cl::desc("Enable the tile register allocation pass"),
+                      cl::init(true), cl::Hidden);
+ 
++static cl::opt<bool>
++    EnableTLBlurInstrumentation("x86-tlblur-instrument",
++                     cl::desc("Enable the TLBlur instrumentation"),
++                     cl::init(false), cl::Hidden);
++
+ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeX86Target() {
+   // Register the target.
+   RegisterTargetMachine<X86TargetMachine> X(getTheX86_32Target());
+@@ -531,6 +536,8 @@ void X86PassConfig::addPreRegAlloc() {
+   }
+ 
+   addPass(createX86SpeculativeLoadHardeningPass());
++  if (EnableTLBlurInstrumentation)
++    addPass(createX86TLBlurInstrumentHeapPass());
+   addPass(createX86FlagsCopyLoweringPass());
+   addPass(createX86DynAllocaExpander());
+ 

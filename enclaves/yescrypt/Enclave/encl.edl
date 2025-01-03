@@ -1,0 +1,9 @@
+enclave {
+	from "common.edl" import *;	
+
+	trusted {
+		public void ecall_select_benchmark(uint64_t id);
+    };
+	untrusted {
+	};
+};

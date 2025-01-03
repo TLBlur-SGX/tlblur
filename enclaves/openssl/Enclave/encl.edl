@@ -1,0 +1,13 @@
+enclave {
+	from "sgx_tsgxssl.edl" import *;
+	from "sgx_pthread.edl" import *;
+	from "common.edl" import *;	
+
+	trusted {
+		public void ecall_select_benchmark(uint64_t id);
+		public void ecall_test();
+    };
+	untrusted {
+		void uprint([in, string] const char *str);
+	};
+};
