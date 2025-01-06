@@ -11,7 +11,6 @@ cmake -B build \
   -DLLVM_TARGETS_TO_BUILD=Native \
   -DLLVM_ENABLE_PROJECTS="llvm;clang;lld;bolt" \
   -DLLVM_ENABLE_SPHINX=Off \
-  -DSPHINX_OUTPUT_HTML=false \
   -DLLVM_ENABLE_DOXYGEN=Off \
   -DBOLT_INCLUDE_DOCS=ON \
   -DCLANG_INCLUDE_DOCS=ON \
@@ -23,5 +22,3 @@ cmake -B build \
   -DCMAKE_C_COMPILER=/usr/bin/clang-15 \
   -DCMAKE_C_COMPILER_LAUNCHER=ccache \
   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-
-# -DCMAKE_INSTALL_PREFIX=/opt/llvm \

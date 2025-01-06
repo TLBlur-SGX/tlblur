@@ -11,7 +11,6 @@ subdir('yescrypt')
 subdir('argon2')
 subdir('wolfssl')
 subdir('openssl')
-# subdir('libgcrypt')
 
 built_enclaves = []
 

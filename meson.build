@@ -222,8 +222,5 @@ sgx_step = static_library('sgx-step',
 )
 
 subdir('runtime')
-# subdir('prefetcher')
 subdir('enclaves')
-subdir('profiler')
 subdir('benchmark')
-subdir('libjpeg_attack')
