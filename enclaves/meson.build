@@ -8,7 +8,6 @@ subdir('micro')
 subdir('rsa')
 subdir('libjpeg')
 subdir('yescrypt')
-subdir('argon2')
 subdir('wolfssl')
 subdir('openssl')
 

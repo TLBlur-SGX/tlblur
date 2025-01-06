@@ -44,6 +44,10 @@ This fork of the SGX SDK includes the TLBlur prefetcher.
 
 Otherwise follow the instructions from the Intel SGX SDK repository and install to `/opt/intel`.
 
+### SGX-Step
+
+Using SGX-Step requires a kernel module to be built and loaded. Read the instructions in the `sgx-step` repository for more information.
+
 ### OpenSSL
 
 To run the OpenSSL benchmarks, OpenSSL for SGX must be compiled with TLBlur instrumentation.
@@ -59,6 +63,7 @@ Prerequisites:
 - [OpenSSL](#openssl) (optional)
 
 1. (optional) enable or disable OpenSSL benchmark in `enclaves/meson.build` by (un)commenting the `subdir('openssl')` line
+  - Binary rewriting of OpenSSL can take a very long time (up to 1 hour)
 2. Run `./configure-build.sh` to configure the meson build directory
 3. Run `ninja -C build install` to build and install enclaves in `$PWD/install`
 
@@ -94,6 +99,70 @@ Prerequisites:
 3. Run `make all` to build the libjpeg enclave. Note: to ensure reproducibility of the attack, you can skip this step and use the existing binaries
 4. `cd attack`
 5. `cargo build --release`
+
+## Usage instructions
+
+### Running enclaves with TLBlur prefetcher
+
+1. Enable AEX-Notify in `enclaves/<program>/Enclave/encl.config.xml`
+2. Make sure TLBlur prefetching is enabled when entering the enclave by calling `tlblur_enable`
+  - example in `ecall_rsa_decode` in `enclaves/rsa/Enclave/encl.c`
+3. Run `ninja -C build install` (see [build instructions](#benchmark-enclaves))
+4. Run one of the test programs with an enclave binary, e.g. `./install/bin/test-rsa ./install/lib/s-encl-rsa-instrumented-relocs-bolt.so`
+  - refer to the [enclave naming scheme](#enclave-naming-scheme) for more information on the enclave binaries
+5. IMPORTANT: make sure to disable AEX-Notify again if you continue with running benchmarks or want to use the profiler
+
+### Reproducing benchmark results
+
+1. `cd evaluation`
+2. Run the `run_benchmarks.sh` script. This will use the [benchmarking tool](#benchmarking-tool) to produce CSV files with benchmark results.
+  - This can take a very long time. To obtain results faster, reduce the number of iterations (at the cost of variance in the results)
+3. Use `plot.py` to create the figure and table from the paper (requires pandas, numpy and matplotlib)
+
+### Using the profiler
+
+Example for running the profiler on `libjpeg`, but can be used with any enclave as long as AEX-Notify is **disabled**.
+
+1. Make sure the SGX-Step kernel module is loaded
+2. `cd sgx-step/app/libjpeg`
+3. `sudo ../profiler/target/release/sgx_tracer --so ./profiler-libjpeg.so -e ./Enclave/encl.so --output trace_libjpeg.vcd`
+
+The resulting VCD file can be analyzed using tools such as [GTKWave](https://gtkwave.github.io/gtkwave/).
+
+### Attacking libjpeg
+
+Change to the `sgx-step/app/libjpeg` directory. Run `cargo run --release -- --help` for usage instructions.
+
+For example, to reconstruct a color image of a Wapiti, assuming the enclave is compiled with AEX-Notify, but without TLBlur prefetching, run:
+
+```sh
+cargo run --release -- -o reconstruct_wapiti_aexnotify.bmp -r reconstruct_wapiti_aexnotify.json -i ../img/Wapiti_from_Wagon_Trails.jpg --aexnotify --color enclave -e ../Enclave/encl.so
+```
+
+## Additional information
+
+### Enclave naming scheme
+
+Benchmarked enclaves are built with different combinations of instrumentation flags, and can be found in `install/lib`.
+The naming scheme can be slightly confusing due to build system limitations, so it is clarified by the following table:
+
+| enclave binary name                                     | compile-time instrumentation | binary instrumentation | instrumentation at jump targets | 16KiB page optimization | additional notes                                   |
+|---------------------------------------------------------|------------------------------|------------------------|---------------------------------|-------------------------|----------------------------------------------------|
+| s-encl-name.so                                          | no                           | no                     | /                               | /                       |                                                    |
+| s-encl-name-relocs-bolt-base.so                         | no                           | no                     | /                               | /                       | rewritten with BOLT, but no binary instrumentation |
+| s-encl-name-instrumented.so                             | yes                          | no                     | /                               | /                       |                                                    |
+| s-encl-name-instrumented-relocs-bolt-base.so            | yes                          | no                     | /                               | /                       | rewritten with BOLT, but no binary instrumentation |
+| s-encl-name-instrumented-relocs-bolt.so                 | yes                          | yes                    | no                              | no                      |                                                    |
+| s-encl-name-instrumented-relocs-bolt-16KiB.so           | yes                          | yes                    | no                              | yes                     |                                                    |
+| s-encl-name-instrumented-relocs-bolt-jmp-tgts-eflags.so | yes                          | yes                    | yes                             | no                      | store rflags before instrumentation call           |
+| s-encl-name-instrumented-relocs-bolt-jmp-tgts.so        | yes                          | yes                    | yes                             | no                      |                                                    |
+| s-encl-name-instrumented-relocs-bolt-opt.so             | yes                          | yes                    | yes                             | yes                     |                                                    |
+| s-encl-name-relocs-bolt.so                              | no                           | yes                    | no                              | no                      |                                                    |
+| s-encl-name-relocs-bolt-16KiB.so                        | no                           | yes                    | no                              | yes                     |                                                    |
+| s-encl-name-relocs-bolt-jmp-tgts-eflags.so              | no                           | yes                    | yes                             | no                      | store rflags before instrumentation call           |
+| s-encl-name-relocs-bolt-jmp-tgts.so                     | no                           | yes                    | yes                             | no                      |                                                    |
+| s-encl-name-relocs-bolt-opt.so                          | no                           | yes                    | yes                             | yes                     |                                                    |
+
 
 ## License
 
