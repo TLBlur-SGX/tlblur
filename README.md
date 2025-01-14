@@ -5,17 +5,18 @@ Maintain a Page Access Map (PAM) to inform a page prefetcher and reconstruct the
 
 ## Overview
 
-- `llvm`: fork of the LLVM project with backend pass (§6.2) and BOLT pass (§6.3) to add instrumentation
 - `runtime`: TLBlur runtime: provides assembly implementation of TLB update instrumentation (§6.1)
-- `benchmark`: benchmarking framework (§9.2)
-- `enclaves`: set of enclaves to use for profiling and benchmarking (§9.2)
+- `llvm`: fork of the LLVM project with backend pass (§6.2) and BOLT pass (§6.3) to add instrumentation
 - `sgx-step`: fork of SGX-Step with Rust bindings, profiler tool (§7.2) and attack on libjpeg (§9.1)
-- `sgx-sdk`: Intel SGX SDK, with SGX-Step patches and TLBlur prefetcher (§7.1)
+  - also contains the Intel SGX SDK as submodule, with SGX-Step patches and TLBlur prefetcher (§7.1)
+- `enclaves`: set of enclaves to use for profiling and benchmarking (§9.2)
+- `benchmark`: benchmarking framework (§9.2)
 
 ## Build instructions
 
 Prerequisites:
 - Modern Intel SGX hardware (AEX-Notify support optional and only needed to run prefetcher)
+  - See [SGX-hardware](https://github.com/ayeks/SGX-hardware)
 - A Linux distribution supported by Intel SGX
 
 ### Cloning the repository
