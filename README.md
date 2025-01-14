@@ -61,11 +61,9 @@ Prerequisites:
 1. `cd enclaves/openssl/intel-sgx-ssl`
 2. Download OpenSSL 3.0.13: `wget https://github.com/openssl/openssl/releases/download/openssl-3.0.13/openssl-3.0.13.tar.gz -o Linux/openssl-3.0.13.tar.gz`
 3. `cd Linux`
-4. Build and install OpenSSL for SGX: 
-  - Build without instrumentation: `make clean all`
-  - Remove OpenSSL sources to force a clean build: `rm -rf ../openssl_source/openssl-3.0.13`
-  - Build with instrumentation: `make TLBLUR=1 clean all`
-  - Install binaries: `sudo make install`
+4. `export TLBLUR_LLVM=<path to tlblur repo>/llvm/install`
+5. Build and install OpenSSL for SGX: `make clean all`
+6. Install with `make install`
 
 ### Benchmark enclaves
 
