@@ -1,7 +1,7 @@
 # TLBlur
 
-Defense against page fault attacks on Intel SGX using the AEX-Notify hardware extension.
-Maintain a Page Access Map (PAM) to inform a page prefetcher and reconstruct the TLB after IRQ in order to hide page accesses from the untrusted operating system.
+TLBlur is a *compiler-assisted defense* against page fault attacks on Intel SGX that leverages the AEX-Notify hardware extension.
+Instrumented code builds a *Page Access Map (PAM)* at runtime to inform a *page prefetcher* and reconstruct the TLB after IRQ in order to hide page accesses from the untrusted operating system.
 
 ## Overview
 
