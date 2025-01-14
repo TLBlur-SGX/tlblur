@@ -62,9 +62,10 @@ Prerequisites:
 2. Download OpenSSL 3.0.13: `wget https://github.com/openssl/openssl/releases/download/openssl-3.0.13/openssl-3.0.13.tar.gz -o Linux/openssl-3.0.13.tar.gz`
 3. `cd Linux`
 4. Build and install OpenSSL for SGX: 
-  - `make clean all`
-  - `make TLBLUR=1 clean all`
-  - `sudo make install`
+  - Build without instrumentation: `make clean all`
+  - Remove OpenSSL sources to force a clean build: `rm -rf ../openssl_source/openssl-3.0.13`
+  - Build with instrumentation: `make TLBLUR=1 clean all`
+  - Install binaries: `sudo make install`
 
 ### Benchmark enclaves
 
