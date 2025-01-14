@@ -7,3 +7,6 @@
 [submodule "sgx-step"]
 	path = sgx-step
 	url = git@github.com:TLBlur-SGX/sgx-step.git
+[submodule "enclaves/openssl/intel-sgx-ssl"]
+	path = enclaves/openssl/intel-sgx-ssl
+	url = git@github.com:TLBlur-SGX/intel-sgx-ssl.git

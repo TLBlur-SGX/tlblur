@@ -53,7 +53,18 @@ Using SGX-Step requires a kernel module to be built and loaded. Read the instruc
 
 To run the OpenSSL benchmarks, OpenSSL for SGX must be compiled with TLBlur instrumentation.
 
-TODO
+Prerequisites:
+- `perl`
+- [Intel SGX SDK](#sgx-sdk)
+- [LLVM with TLBlur passes](#llvm)
+
+1. `cd enclaves/openssl/intel-sgx-ssl`
+2. Download OpenSSL 3.0.13: `wget https://github.com/openssl/openssl/releases/download/openssl-3.0.13/openssl-3.0.13.tar.gz -o Linux/openssl-3.0.13.tar.gz`
+3. `cd Linux`
+4. Build and install OpenSSL for SGX: 
+  - `make clean all`
+  - `make TLBLUR=1 clean all`
+  - `sudo make install`
 
 ### Benchmark enclaves
 
