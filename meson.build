@@ -141,7 +141,7 @@ trusted_link_args = [
   '-Wl,--defsym,__ImageBase=0',
   '-lsgx_pthread',
   '-Xlinker', '-verbose',
-  # '-Xlinker', '-T', meson.source_root() / 'enclaves/tlblur.ld',
+  '-Xlinker', '-T', meson.source_root() / 'enclaves/tlblur.ld',
 ]
 
 bolt_args = [
