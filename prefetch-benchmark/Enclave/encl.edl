@@ -1,0 +1,11 @@
+enclave {
+	trusted {
+        public void enclave_call([user_check] uint64_t *time_end, uint64_t iterations);
+        public uint64_t enclave_setup(uint64_t pws, [user_check] uint64_t *timings);
+    };
+	
+	untrusted {
+        void ocall_print_string([in, string] const char *str);
+        void ocall_print_int([in, string] const char *str, uint64_t i);
+	};
+};
