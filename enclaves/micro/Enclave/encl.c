@@ -6,12 +6,6 @@
 
 #define SIZE 0x10000
 
-#define SHADOW_PT_SIZE 0x10000
-extern uint64_t __tlblur_shadow_pt[SHADOW_PT_SIZE];
-extern uint64_t __tlblur_global_counter;
-extern uint64_t __tlblur_global_code_counter;
-extern void (*tlblur_tlb_update)(void);
-
 void long_func(void);
 void long_loop(void);
 uint64_t memory[SIZE] = {0};
@@ -34,8 +28,6 @@ int fibonacci(int n) {
   else
     return fibonacci(n - 1) + fibonacci(n - 2);
 }
-
-extern void dump_vtlb(void);
 
 void ecall_select_benchmark(uint64_t id) {
   benchmark_id = id;

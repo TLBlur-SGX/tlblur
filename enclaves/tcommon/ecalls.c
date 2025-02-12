@@ -1,17 +1,16 @@
 #include "cacheutils.h"
 #include <stdint.h>
 
-extern uint64_t __tlblur_shadow_pt;
-extern uint64_t __tlblur_global_counter;
-extern uint64_t __tlblur_global_code_counter;
-extern void tlblur_tlb_update(void);
+extern uint64_t __tlblur_pam;
+extern uint64_t __tlblur_counter;
+extern void tlblur_pam_update(void);
 extern int benchmark_inner();
 
-char *ecall_get_vtlb_addr() { return (char *)(&__tlblur_shadow_pt); }
+char *ecall_get_vtlb_addr() { return (char *)(&__tlblur_pam); }
 
-void *ecall_get_tlblur_code_addr() { return (void *)(tlblur_tlb_update); }
+void *ecall_get_tlblur_code_addr() { return (void *)(tlblur_pam_update); }
 
-uint64_t *ecall_get_vtlb_counter() { return &__tlblur_global_counter; }
+uint64_t *ecall_get_vtlb_counter() { return &__tlblur_counter; }
 
 int ecall_run_benchmark(uint64_t warmup_iterations, uint64_t iterations,
                         uint64_t *results, uint64_t *data_accesses,
@@ -23,8 +22,7 @@ int ecall_run_benchmark(uint64_t warmup_iterations, uint64_t iterations,
   }
   
   for (int i = 0; i < iterations; i++) {
-    uint64_t data_counter_original = __tlblur_global_counter;
-    uint64_t code_counter_original = __tlblur_global_code_counter;
+    uint64_t counter_original = __tlblur_counter;
 
     uint64_t counter_start = rdtsc_begin();
     int res = benchmark_inner();
@@ -32,8 +30,7 @@ int ecall_run_benchmark(uint64_t warmup_iterations, uint64_t iterations,
       return res;
     results[i] = rdtsc_end() - counter_start;
 
-    data_accesses[i] = __tlblur_global_counter - data_counter_original;
-    code_accesses[i] = __tlblur_global_code_counter - code_counter_original;
+    data_accesses[i] = __tlblur_counter - counter_original;
   }
 
   return 0;

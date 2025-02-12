@@ -61,6 +61,7 @@ SECTIONS
     *(.text.hot .text.hot.*)
     *(SORT(.text.sorted.*))
     *(.text .stub .text.* .gnu.linkonce.t.*)
+    *(.tlblur.text)
     /* .gnu.warning sections are handled specially by elf.em.  */
     *(.gnu.warning)
     *(.nipx)
