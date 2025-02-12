@@ -22,7 +22,7 @@
 #include "sgx_trts_aex.h"
 #include "sgx_trts_exception.h"
 
-extern void tlblur_tlb_update(uint64_t addr);
+extern void tlblur_pam_update(uint64_t addr);
 extern char dummy_array[10000000];
 extern uint64_t g_tlblur_pam_size;
 uint64_t dummy[16] = {69};
@@ -42,7 +42,7 @@ uint64_t enclave_setup(uint64_t pws, uint64_t *t) {
   sgx_register_exception_handler(1, skip_ud2);
 
   for (int i = 0; i < 500; i++) {
-    tlblur_tlb_update((uint64_t)(dummy_array + (i * 4096)));
+    tlblur_pam_update((uint64_t)(dummy_array + (i * 4096)));
   }
 
   tlblur_enable(pws);

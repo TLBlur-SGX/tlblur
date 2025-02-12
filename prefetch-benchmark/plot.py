@@ -8,6 +8,16 @@ import matplotlib.pyplot as plt
 def geometric_mean(data):
     return np.exp(np.log(data).mean())
 
+scale_factor = 0.65
+font_size = 14*scale_factor
+
+x_size = 9
+y_size = 3.5
+
+plt.rcParams['font.size'] = font_size
+plt.rcParams['pdf.fonttype'] = 42
+plt.rcParams['ps.fonttype'] = 42
+
 # Directory containing CSV files
 csv_directory = "./out"
 
@@ -35,18 +45,20 @@ for file_path in glob.glob(os.path.join(csv_directory, "bench_n*_pws*_pam*.csv")
 # Convert results to DataFrame for easier plotting
 results_df = pd.DataFrame(results, columns=["n", "PWS", "PAM", "GeometricMeanTotal"])
 
+markers = ['o', 's', '^']
+
 # Group by PAM to plot multiple lines
-plt.figure(figsize=(10, 6))
-for pam_value, group in results_df.groupby("PAM"):
+plt.figure(figsize=(x_size*scale_factor, y_size*scale_factor))
+for i, (pam_value, group) in enumerate(results_df.groupby("PAM")):
     # Sort the group by PWS for proper plotting
     group = group.sort_values("PWS")
-    plt.plot(group["PWS"], group["GeometricMeanTotal"], marker="o", label=f"|PAM|={pam_value}")
+    plt.plot(group["PWS"], group["GeometricMeanTotal"], label=f"|PAM|={pam_value}", marker=markers[i])
 
 # Plot formatting
-plt.title("Geometric Mean of Total Cycles by PWS for Different PAM Sizes")
-plt.xlabel("|PWS|")
-plt.ylabel("Geometric Mean of Total Cycles")
+# plt.title("Geometric Mean of Total Cycles by PWS for Different PAM Sizes")
+plt.xlabel("PWS Size")
+plt.ylabel("Geometric Mean of Cycles")
 plt.grid(True, linestyle="--", alpha=0.6)
-plt.legend(title="PAM Sizes")
+plt.legend()
 plt.tight_layout()
-plt.savefig("plot.png")
+plt.savefig("plot.pdf")

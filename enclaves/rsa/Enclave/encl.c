@@ -97,10 +97,7 @@ int ecall_rsa_decode(int cipher)
     /* Decrypt blinded message with square and multiply algorithm. */
     res = modpow(cipher, rsa_d, rsa_n);
 
-    uint64_t aex_count = 0; 
     tlblur_disable();
-    // ocall_print_int("AEX count: %lu", aex_count);
-    /* Unblind result. */
     return (res * inverse(r, rsa_n)) % rsa_n;
 }
 
