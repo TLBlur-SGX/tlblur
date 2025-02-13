@@ -15,11 +15,6 @@ pushd sgx-step/sdk/intel-sdk
   ./install_SGX_SDK.sh
 popd
 
-echo "--- [ loading SGX-Step kernel module ] ---"
-pushd sgx-step/kernel
-make clean load
-popd
-
 echo "--- [ building OpenSSL ] ---"
 pushd enclaves/openssl/intel-sgx-ssl
   wget https://github.com/openssl/openssl/releases/download/openssl-3.0.13/openssl-3.0.13.tar.gz -o Linux/openssl-3.0.13.tar.gz
