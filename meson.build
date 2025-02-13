@@ -217,6 +217,7 @@ sgx_step = static_library('sgx-step',
   './sgx-step/libsgxstep/pt.c',
   './sgx-step/libsgxstep/sched.c',
   './sgx-step/libsgxstep/spy.c',
+  './sgx-step/libsgxstep/simstep.c',
   c_args : c_args,
   pic : true,
 )
@@ -224,3 +225,4 @@ sgx_step = static_library('sgx-step',
 subdir('runtime')
 subdir('enclaves')
 subdir('benchmark')
+subdir('profiler')
