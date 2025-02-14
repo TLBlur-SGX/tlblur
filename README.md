@@ -24,8 +24,13 @@ Prerequisites:
 Make sure to clone the repository with all its submodules:
 
 ```sh
-git clone --recurse-submodules https://github.com/TLBlur-SGX/tlblur.git
+$ git clone --recurse-submodules https://github.com/TLBlur-SGX/tlblur.git
 ```
+
+### Build everything at once
+
+Use the `build.sh` script to build LLVM, SGX SDK, benchmarks and tools at once.
+Only tested on Ubuntu 22.04.
 
 ### LLVM
 
@@ -59,7 +64,7 @@ Prerequisites:
 - [LLVM with TLBlur passes](#llvm)
 
 1. `cd enclaves/openssl/intel-sgx-ssl`
-2. Download OpenSSL 3.0.13: `wget https://github.com/openssl/openssl/releases/download/openssl-3.0.13/openssl-3.0.13.tar.gz -o Linux/openssl-3.0.13.tar.gz`
+2. Download OpenSSL 3.0.13: `wget https://github.com/openssl/openssl/releases/download/openssl-3.0.13/openssl-3.0.13.tar.gz -O openssl_source/openssl-3.0.13.tar.gz`
 3. `cd Linux`
 4. `export TLBLUR_LLVM=<path to tlblur repo>/llvm/install`
 5. Build and install OpenSSL for SGX: `make clean all`
@@ -75,7 +80,7 @@ Prerequisites:
 
 1. (optional) enable or disable OpenSSL benchmark in `enclaves/meson.build` by (un)commenting the `subdir('openssl')` line
   - Binary rewriting of OpenSSL can take a very long time (up to 1 hour)
-2. Run `./configure-build.sh` to configure the meson build directory
+2. Run `./configure_build.sh` to configure the meson build directory
 3. Run `ninja -C build install` to build and install enclaves in `$PWD/install`
 
 ### Benchmarking tool
@@ -107,9 +112,10 @@ Prerequisites:
 
 1. `export LIBSGXSTEP="$PWD/sgx-step/libsgxstep/`
 2. `cd sgx-step/app/libjpeg`
-3. Run `make all` to build the libjpeg enclave. Note: to ensure reproducibility of the attack, you can skip this step and use the existing binaries
-4. `cd attack`
-5. `cargo build --release`
+3. `source /opt/intel/sgxsdk/environment`
+4. Run `make clean all` to build the libjpeg enclave. Note: to ensure reproducibility of the attack, you can skip this step and use the existing binaries
+5. `cd attack`
+6. `cargo build --release`
 
 ## Usage instructions
 
@@ -136,7 +142,15 @@ Example for running the profiler on `libjpeg`, but can be used with any enclave 
 
 1. Make sure the SGX-Step kernel module is loaded
 2. `cd sgx-step/app/libjpeg`
-3. `sudo ../profiler/target/release/sgx_tracer --so ./profiler-libjpeg.so -e ./Enclave/encl.so --output trace_libjpeg.vcd`
+3. Run `sgx_tracer`:
+
+```sh
+$ sudo ../profiler/target/release/sgx_tracer \
+    --so ./profiler-libjpeg.so \
+    -e ./Enclave/encl.so \
+    --output trace.vcd \
+    --args img/birds.jpg 10000000 10000000
+```
 
 The resulting VCD file can be analyzed using tools such as [GTKWave](https://gtkwave.github.io/gtkwave/).
 
@@ -147,8 +161,27 @@ Change to the `sgx-step/app/libjpeg` directory. Run `cargo run --release -- --he
 For example, to reconstruct a color image of a Wapiti, assuming the enclave is compiled with AEX-Notify, but without TLBlur prefetching, run:
 
 ```sh
-cargo run --release -- -o reconstruct_wapiti_aexnotify.bmp -r reconstruct_wapiti_aexnotify.json -i ../img/Wapiti_from_Wagon_Trails.jpg --aexnotify --color enclave -e ../Enclave/encl.so
+$ cargo run --release -- -o reconstruct_wapiti_aexnotify.bmp -r reconstruct_wapiti_aexnotify.json -i ../img/Wapiti_from_Wagon_Trails.jpg --aexnotify --color enclave -e ../Enclave/encl.so
 ```
+
+### TLBlur simulation with profiler
+
+To run the profiler with the instrumented binary with a PWS size of 30, simulating the effect of TLblur with a set-associative hardware TLB with 8 ways and 1024 sets, use the following commands:
+
+```sh
+$ export TLBLUR_LIB="$PWD/install/lib"
+$ cd sgx-step/app/libjpeg
+$ sudo \
+  ../profiler/target/release/sgx_tlblur_sim \
+  --so $TLBLUR_LIB/libprof-libjpeg.so \
+  -e $TLBLUR_LIB/s-encl-libjpeg-instrumented-relocs-bolt.so \
+  --output trace_30.vcd \
+  --args img/birds.jpg 10000000 10000000 \
+  --pws-size 30 --irq-pat page-fault \
+  --hw-tlb set-associative \
+  --ways 8 --sets 1024
+```
+
 
 ## Additional information
 

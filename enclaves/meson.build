@@ -9,7 +9,7 @@ subdir('rsa')
 subdir('libjpeg')
 subdir('yescrypt')
 subdir('wolfssl')
-# subdir('openssl')
+subdir('openssl')
 
 built_enclaves = []
 
