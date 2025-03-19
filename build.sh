@@ -2,6 +2,23 @@
 
 set -e
 
+sudo echo "enabling sudo for duration of this script"
+
+# Start a background process to keep sudo alive
+( while true; do sudo -v; sleep 60; done ) &
+
+# Get the PID of the background process
+bg_pid=$!
+
+# Function to clean up the background process on exit
+cleanup() {
+    echo "killing sudo background thread.."
+    kill "$bg_pid" 2>/dev/null
+}
+
+# Set a trap to call cleanup on script exit
+trap cleanup EXIT
+
 TLBLUR_DIR=$(pwd)
 
 echo "--- [ building LLVM ] ---"
@@ -21,7 +38,7 @@ pushd enclaves/openssl/intel-sgx-ssl
   pushd Linux
     export TLBLUR_LLVM=$TLBLUR_DIR/llvm/install
     make clean all
-    make install
+    sudo make install
   popd
 popd
 

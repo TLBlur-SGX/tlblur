@@ -13,6 +13,42 @@ void printf(const char *fmt, ...) {
   uprint(buf);
 }
 
+/*  Start workaround undefined references in openssl in code that should not be reached in SGX anyway */
+char *strcpy(char *dst, const char *src)
+{
+	return strncpy(dst, src, strlen(src));
+}
+
+char *strcat(char *dst, const char *src)
+{
+	return strncat(dst, src, strlen(src));
+}
+
+size_t read(int fd, void *buf, size_t count)
+{
+	return -1;
+}
+
+void *getservbyname(const char *name, const char *proto)
+{
+	return NULL;
+}
+
+uint16_t ntohs(uint16_t netshort)
+{
+	return 0;
+}
+
+uint16_t htons(uint16_t hostshort)
+{
+	return 0;
+}
+
+uint64_t __h_errno_location;
+
+/*  End workaround undefined references in openssl in code that should not be reached in SGX anyway */
+
+
 #include <openssl/evp.h>
 #include <stdio.h>
 #include <openssl/rsa.h>
