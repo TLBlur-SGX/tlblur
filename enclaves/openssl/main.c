@@ -13,9 +13,9 @@ int main(int argc, char **argv) {
   uint64_t res[10];
   uint64_t data[10];
   uint64_t code[10];
-  // SGX_ASSERT(ecall_select_benchmark(eid, 0));
-  // SGX_ASSERT(ecall_run_benchmark(eid, &ret, 10, 10, res, data, code));
-  // ASSERT(ret == 0);
+  SGX_ASSERT(ecall_select_benchmark(eid, 0));
+  SGX_ASSERT(ecall_run_benchmark(eid, &ret, 10, 10, res, data, code));
+  ASSERT(ret == 0);
   SGX_ASSERT(ecall_select_benchmark(eid, 1));
   SGX_ASSERT(ecall_run_benchmark(eid, &ret, 10, 10, res, data, code));
   ASSERT(ret == 0);
