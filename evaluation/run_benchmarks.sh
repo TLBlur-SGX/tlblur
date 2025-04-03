@@ -56,7 +56,6 @@ run_all_variants "rsa" "openssl" 1
 WARMUP=100
 ITERATIONS=2000
 run_all_variants "yescrypt" "yescrypt" 0
-# run_all_variants "scrypt" "yescrypt" 1
 run_all_variants "pbkdf2-sha256" "yescrypt" 2
 
 WARMUP=10000
