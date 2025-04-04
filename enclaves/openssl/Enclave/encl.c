@@ -409,9 +409,7 @@ void ecall_select_benchmark(uint64_t id) {
 int benchmark_inner() {
   switch (benchmark_id) {
   case 0:
-    if (aesccm_test() != 0) {
-      return 1;
-    }
+    return aesccm_test();
   case 1:
     if (test_rsa_pkcs1(0) != 1) {
       return 1;
